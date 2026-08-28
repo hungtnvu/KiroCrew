@@ -1506,7 +1506,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "telemetry.beacon_enabled"
   },
   {
-    "id": "security.agent-identity",
+    "id": "security.identity",
     "labelKey": "pages.settings.securityPanel.agent_identity",
     "tab": "security",
     "type": "select",
@@ -1527,6 +1527,17 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "section": "rules"
     },
     "label": "Denied Commands"
+  },
+  {
+    "id": "security.gateway-url",
+    "labelKey": "pages.settings.securityPanel.agent_identity_gateway_url",
+    "tab": "security",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "section": "identity"
+    },
+    "label": "Gateway URL"
   },
   {
     "id": "security.governance-policy",
@@ -1550,14 +1561,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     },
     "configKey": "agent.yolo_duration",
     "label": "How long auto-approve stays on"
-  },
-  {
-    "id": "security.identity",
-    "label": "Identity",
-    "labelKey": "pages.settings.securityPanel.agent_identity_posture",
-    "tab": "security",
-    "type": "select",
-    "occurrence": 1
   },
   {
     "id": "security.live-security-posture",
@@ -1592,6 +1595,17 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "section": "tailnet"
     },
     "label": "Trust this machine's tailnet name"
+  },
+  {
+    "id": "security.workload-name",
+    "labelKey": "pages.settings.securityPanel.agent_identity_name",
+    "tab": "security",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "section": "identity"
+    },
+    "label": "Workload name"
   },
   {
     "id": "security.your-custom-denies",
