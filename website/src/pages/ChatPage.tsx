@@ -7965,7 +7965,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onSend={() => send()}
               canSteer={composerBusy}
               onSteer={steer}
-              onFollowUpSend={(text?: string) => send(text)}
+              onFollowUpSend={(text?: string) => {
+                // Double-click and the Send-now segment call onSend, not
+                // onSelect (#6240). Same plan gate as the single-click
+                // branch below: a typed Cancel never stops the plan.
+                if (text && followUpIsPlan && isPlanAction(text) && effectiveMode === 'orchestrator' && activeSlot) {
+                  planActionMutationRef.current.mutate({
+                    slot: activeSlot,
+                    action: text,
+                    clickedSourceKey: followUpSourceKey,
+                  })
+                  return
+                }
+                send(text)
+              }}
               disabled={
                 /* Streaming, compaction, and stopping all
                    keep the input interactive: api_chat queues on slot.running and

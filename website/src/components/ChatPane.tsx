@@ -849,7 +849,23 @@ export default function ChatPane({
               setFollowUpPicked(next)
             }
           }}
-          onFollowUpSend={(text?: string) => doSend(text)}
+          onFollowUpSend={(text?: string) => {
+            // Double-click and the Send-now segment call onSend, not onSelect
+            // (#6240). A plan label must still hit the plan endpoint — a typed
+            // Cancel never stops the plan, and Go All loses auto-run.
+            if (text && followUpIsPlan && isPlanAction(text)) {
+              if (!paneSlot) return
+              if (paneSlot.mode === 'orchestrator') {
+                planActionMutationRef.current.mutate({
+                  slot: slotKey,
+                  action: text,
+                  clickedSourceKey: followUpSourceKey,
+                })
+                return
+              }
+            }
+            doSend(text)
+          }}
           project={paneSlot?.project ?? ''}
           onUploadFiles={uploadFiles}
           pendingFiles={pendingFiles}
