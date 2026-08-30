@@ -5,6 +5,8 @@ import {
 } from '../../../components/ui/dropdown-menu'
 import { ProviderLogo, ProviderHostTag } from './ProviderBadge'
 import { useIssueRadar } from '../context'
+import { sameRepoRef } from '../lib/links'
+import type { RepoRef } from '../api'
 import ReadOnlyTag, { isReadOnly } from './ReadOnlyTag'
 
 import { i18nT } from '../../../i18n/t'
@@ -77,11 +79,7 @@ export default function RepoSwitcher() {
   // Matched on the full identity, not just owner/repo: on a mixed install the
   // same slug can exist on two providers, and matching loosely would badge the
   // active repo with the other one's permissions.
-  const sameRepo = (r: { owner: string; repo: string; provider?: string; host?: string }) =>
-    r.owner === active.owner
-    && r.repo === active.repo
-    && (r.provider || 'github') === (active.provider || 'github')
-    && (r.host || 'github.com') === (active.host || 'github.com')
+  const sameRepo = (r: RepoRef) => sameRepoRef(r, active)
   const activeEntry = repos.find(sameRepo)
   return (
     <DropdownMenu>
