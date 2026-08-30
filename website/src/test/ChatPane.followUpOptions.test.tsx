@@ -690,6 +690,29 @@ describe('ChatPane plan follow-ups dispatch (issue #5893)', () => {
     expect(composer().value).toBe('')
   })
 
+  it('a double-click whose footer is REPLACED between clicks never dispatches (issue #6240 race)', async () => {
+    // First click of a double-click arms the chip with row-1. A byte-identical
+    // replacement footer reuses the chip; the second click must hand the
+    // FIRST-click key to onSend so the hook refuses the replacement stage.
+    const store = await renderPane('pane-plan-dbl-stale', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { fireEvent.click(chip('Go'), { detail: 1 }) })
+    await act(async () => {
+      store.dispatch(appendSlotMessage({
+        slot: 'pane-plan-dbl-stale',
+        message: { role: 'assistant', content: ASSISTANT_WITH_PLAN, ts: '2026-08-25T00:06:00Z' } as never,
+      }))
+    })
+    await act(async () => {
+      fireEvent.click(chip('Go'), { detail: 2 })
+      fireEvent.doubleClick(chip('Go'))
+    })
+    expect(api.planAction).not.toHaveBeenCalled()
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
   it('Send now on a NON-plan chip still sends the label through the pane\'s send path', async () => {
     await renderPane('pane-plan-sendnow-plain', { mode: 'orchestrator' }, PANE_MESSAGES)
     await waitFor(() => expect(screen.getByRole('button', { name: 'Alpha' })).toBeTruthy())
