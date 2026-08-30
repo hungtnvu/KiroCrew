@@ -370,6 +370,17 @@ export function useWebSocket() {
       automationSeedQueuedRef.current = false
       const seedGen = ++automationSeedGenRef.current
       const liveAtStart = new Map(automationLiveGenRef.current)
+      const cacheUpdatesAtStart = new Map<string, number>()
+      for (const [queryKey, cached] of queryClient.getQueriesData<
+        ReturnType<typeof normalizeAutomationRecord>
+      >({ queryKey: ['session-automation'] })) {
+        if (cached && queryKey.length === 2) {
+          cacheUpdatesAtStart.set(
+            cached.slotKey,
+            queryClient.getQueryState(queryKey)?.dataUpdateCount ?? 0,
+          )
+        }
+      }
       // Fully best-effort, including SYNCHRONOUS failure. This runs early in the
       // connect handler, ahead of notification sync and the subagent subscribe, so
       // an exception escaping here would silently strand those — a cosmetic seed
@@ -435,6 +446,11 @@ export function useWebSocket() {
               || queryKey.length !== 2
               || protectedSlotSet.has(cached.slotKey)
               || presentSlots.has(cached.slotKey)) continue
+            // A mutation or focused REST refetch may populate this per-slot
+            // cache while the reconnect snapshot is still in flight. Only an
+            // entry known to predate the seed can be absent authoritatively.
+            const cachedUpdates = queryClient.getQueryState(queryKey)?.dataUpdateCount
+            if (cachedUpdates !== cacheUpdatesAtStart.get(cached.slotKey)) continue
             const complete = cached.kind === 'legacy_goal_loop'
               ? legacyComplete
               : structuredComplete

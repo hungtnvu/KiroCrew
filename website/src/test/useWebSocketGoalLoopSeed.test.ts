@@ -16,6 +16,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { api } from '../api/client'
+import { normalizeAutomationRecord } from '../monitoring/automation'
 
 /** Resolved by hand inside the test so the in-flight window is controllable. */
 let seedDeferred: { resolve: (v: unknown) => void; promise: Promise<unknown> }
@@ -93,6 +94,7 @@ const TERMINAL_MONITOR = {
 
 describe('useWebSocket automation seed vs live frames', () => {
   let testStore: ReturnType<typeof createTestStore>
+  let queryClient: QueryClient
 
   beforeEach(() => {
     vi.clearAllMocks()
@@ -100,15 +102,15 @@ describe('useWebSocket automation seed vs live frames', () => {
     seedDeferred = newDeferred()
     monitorSeedDeferred = newDeferred()
     testStore = createTestStore({})
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     vi.stubGlobal('WebSocket', MockWebSocket)
   })
 
   afterEach(() => { vi.unstubAllGlobals() })
 
   function wrapper({ children }: { children: React.ReactNode }) {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     return createElement(Provider, { store: testStore },
-      createElement(QueryClientProvider, { client: qc }, children),
+      createElement(QueryClientProvider, { client: queryClient }, children),
     )
   }
 
@@ -134,6 +136,22 @@ describe('useWebSocket automation seed vs live frames', () => {
     expect(automations()['chat-1-1721']).toMatchObject({
       kind: 'legacy_goal_loop', cycleCount: 7, maxCycles: 24,
     })
+  })
+
+  it('does not tombstone a per-slot snapshot written after the seed started', async () => {
+    renderHook(() => useWebSocket(), { wrapper })
+    act(() => { WS_INSTANCES[0].simulateOpen() })
+
+    const newer = normalizeAutomationRecord({ ...LOOP, cycle_count: 9 })
+    expect(newer).not.toBeNull()
+    queryClient.setQueryData(['session-automation', LOOP.slot_key], newer)
+
+    await act(async () => {
+      seedDeferred.resolve({ enabled: true, loops: [] })
+      await Promise.all([seedDeferred.promise, resolveEmptyMonitors()])
+    })
+
+    expect(queryClient.getQueryData(['session-automation', LOOP.slot_key])).toEqual(newer)
   })
 
   it('coalesces overlapping reconnect seeds onto one request per feed', async () => {
