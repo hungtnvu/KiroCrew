@@ -456,7 +456,8 @@ class TestCreateSubprocessLimited:
         workspace = tmp_path / "pinned"
         self._planted_tool(workspace / "bin", body="#!/bin/sh\nexit 9\n")
         real_dir = tmp_path / "pinned-outside"
-        real = self._planted_tool(real_dir)
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
         descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
         spawn = AsyncMock()
         try:
@@ -468,8 +469,8 @@ class TestCreateSubprocessLimited:
                 )
         finally:
             os.close(descriptor)
-        assert strip_spawn_shim(spawn.await_args.args) == (str(real),)
-        assert spawn.await_args.kwargs["env"]["PATH"] == str(real_dir)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
 
     @pytest.mark.asyncio
     async def test_chdir_fd_drops_the_pinned_directory_itself_as_a_path_entry(self, tmp_path):
@@ -477,7 +478,8 @@ class TestCreateSubprocessLimited:
         workspace = tmp_path / "pinned"
         self._planted_tool(workspace, body="#!/bin/sh\nexit 9\n")
         real_dir = tmp_path / "real-bin"
-        real = self._planted_tool(real_dir)
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
         descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
         spawn = AsyncMock()
         try:
@@ -489,8 +491,8 @@ class TestCreateSubprocessLimited:
                 )
         finally:
             os.close(descriptor)
-        assert strip_spawn_shim(spawn.await_args.args) == (str(real),)
-        assert spawn.await_args.kwargs["env"]["PATH"] == str(real_dir)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
 
     @pytest.mark.asyncio
     async def test_chdir_fd_drops_a_symlink_alias_of_the_pinned_directory(
@@ -508,7 +510,8 @@ class TestCreateSubprocessLimited:
         alias = tmp_path / "alias"
         os.symlink(workspace, alias)
         real_dir = tmp_path / "real-bin"
-        real = self._planted_tool(real_dir)
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)  # before realpath is broken below
         monkeypatch.setattr(sandbox.os.path, "realpath", lambda path, **_kwargs: os.fspath(path))
         descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
         spawn = AsyncMock()
@@ -521,8 +524,8 @@ class TestCreateSubprocessLimited:
                 )
         finally:
             os.close(descriptor)
-        assert strip_spawn_shim(spawn.await_args.args) == (str(real),)
-        assert spawn.await_args.kwargs["env"]["PATH"] == str(real_dir)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
 
     @pytest.mark.asyncio
     async def test_chdir_fd_with_only_workspace_path_entries_resolves_nothing(self, tmp_path):
@@ -556,7 +559,8 @@ class TestCreateSubprocessLimited:
         not_a_dir = tmp_path / "not-a-dir"
         not_a_dir.write_text("")
         real_dir = tmp_path / "real-bin"
-        real = self._planted_tool(real_dir)
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
         descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
         spawn = AsyncMock()
         try:
@@ -568,8 +572,63 @@ class TestCreateSubprocessLimited:
                 )
         finally:
             os.close(descriptor)
-        assert strip_spawn_shim(spawn.await_args.args) == (str(real),)
-        assert spawn.await_args.kwargs["env"]["PATH"] == str(real_dir)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_respells_a_kept_entry_from_the_verified_descriptor(self, tmp_path):
+        """A kept entry is the OPENED descriptor's canonical path, not the spelling.
+
+        The child re-resolves its ``PATH`` strings at its own lookup, so a kept
+        spelling that traverses a symlink could be retargeted between this
+        screen and that lookup -- pointing the child at a directory the screen
+        never verified. Emitting the descriptor-derived path pins the child to
+        the identity that passed the screen.
+        """
+        workspace = tmp_path / "pinned"
+        workspace.mkdir()
+        real_dir = tmp_path / "real-bin"
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
+        link = tmp_path / "mutable-link"
+        os.symlink(real_dir, link)
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        spawn = AsyncMock()
+        try:
+            with patch("asyncio.create_subprocess_exec", spawn):
+                await create_subprocess_limited(
+                    "mytool", chdir_fd=descriptor, env={"PATH": str(link)}
+                )
+        finally:
+            os.close(descriptor)
+        # Both consumers see the canonical directory; the mutable spelling is gone.
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_drops_an_entry_whose_canonical_path_is_unreadable(self, tmp_path):
+        """Unresolvable canonical path => the entry is dropped, never the raw spelling.
+
+        Falling back to the caller's spelling would reopen the retarget window
+        the re-spelling exists to close, so the degrade direction is DROP --
+        here that empties ``PATH`` and the resolve fails closed.
+        """
+        workspace = tmp_path / "pinned"
+        workspace.mkdir()
+        real_dir = tmp_path / "real-bin"
+        self._planted_tool(real_dir)
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with (
+                patch("asyncio.create_subprocess_exec", AsyncMock()),
+                patch("kiro_crew.hooks._fd_real_path", return_value=None),
+            ):
+                with pytest.raises(FileNotFoundError):
+                    await create_subprocess_limited(
+                        "mytool", chdir_fd=descriptor, env={"PATH": str(real_dir)}
+                    )
+        finally:
+            os.close(descriptor)
 
     @pytest.mark.asyncio
     async def test_an_unreadable_bound_descriptor_degrades_to_the_lexical_screen(self, tmp_path):

@@ -6598,10 +6598,14 @@ def _pinned_spawn_path(
       child's own later lookup the moment the shim has entered the pinned
       directory. Entries are compared by ``(st_dev, st_ino)`` ancestry walked
       over descriptors -- never by pathname -- so a symlink or other alias of
-      the pinned directory cannot dodge the screen. An entry that cannot be
-      opened or walked is dropped, fail-closed per entry: an unopenable entry
-      cannot contribute a resolvable binary today, and dropping is the
-      direction that cannot be gamed by making a directory un-``stat``-able.
+      the pinned directory cannot dodge the screen. A kept entry is emitted as
+      the OPENED descriptor's own canonical path, never the caller's spelling:
+      the child re-resolves its ``PATH`` strings later, so a spelling that
+      traverses a retargetable symlink could be pointed somewhere else between
+      this screen and that lookup. An entry that cannot be opened, walked, or
+      re-spelled is dropped, fail-closed per entry: an unopenable entry cannot
+      contribute a resolvable binary today, and dropping is the direction that
+      cannot be gamed by making a directory un-``stat``-able.
 
     When the BOUND descriptor's own identity cannot be read there is nothing to
     compare entries against, so the lexical screen stands alone for that spawn.
@@ -6626,6 +6630,12 @@ def _pinned_spawn_path(
         else:
             bound_identity = (bound_info.st_dev, bound_info.st_ino)
     if bound_identity is not None:
+        # Local import: hooks imports sandbox at call time, so a module-level
+        # dependency would be circular. `_fd_real_path` is private but already
+        # borrowed this way by `bound_agent_workspace_target` above; issue
+        # #6907 tracks promoting it to a shared home.
+        from kiro_crew.hooks import _fd_real_path
+
         screened: list[str] = []
         for entry in entries:
             try:
@@ -6634,16 +6644,29 @@ def _pinned_spawn_path(
                 continue
             try:
                 ancestors = _directory_ancestor_identities(entry_fd)
+                if bound_identity in ancestors:
+                    # The walk yields the entry's OWN identity first, so one
+                    # membership test covers both "the entry IS the pinned
+                    # directory" and "the entry lives beneath it".
+                    continue
+                # Keep the OPENED descriptor's own canonical path, never the
+                # caller's spelling. The child re-resolves whatever string ends
+                # up in its PATH, so a kept spelling that traverses a symlink
+                # could be retargeted between this screen and that lookup --
+                # the identity verified here must be the identity the child
+                # reaches. A canonical path has no symlink components, and one
+                # inside the pinned directory cannot exist here (its target
+                # would have failed the ancestry test above). Unresolvable ==
+                # dropped: falling back to the mutable spelling would reopen
+                # the window this screen exists to close.
+                resolved_entry = _fd_real_path(entry_fd)
             except OSError:
                 continue
             finally:
                 os.close(entry_fd)
-            # The walk yields the entry's OWN identity first, so one membership
-            # test covers both "the entry IS the pinned directory" and "the
-            # entry lives beneath it".
-            if bound_identity in ancestors:
+            if resolved_entry is None:
                 continue
-            screened.append(entry)
+            screened.append(resolved_entry)
         entries = screened
     source["PATH"] = os.pathsep.join(entries)
     return source
@@ -6734,12 +6757,15 @@ async def create_subprocess_limited(
         # (b) The search below gets no cwd and a PATH screened by directory IDENTITY:
         #     relative entries are dropped, and so is any absolute entry that IS the
         #     pinned directory or lives beneath it -- compared by (st_dev, st_ino)
-        #     ancestry, so an alias cannot dodge it. A bare name IS the normal shape
-        #     here -- the macOS sandbox wrapper hands back "env" as argv[0] and the
-        #     Linux cgroup wrapper hands back "systemd-run" -- so the search cannot
-        #     simply be refused, and `execvpe` resolved a relative entry against the
-        #     child's cwd, i.e. the pinned workspace. An absolute entry pointing INTO
-        #     that workspace reaches the same binary by a different spelling.
+        #     ancestry, so an alias cannot dodge it; kept entries are re-spelled from
+        #     the verified descriptor, so a retargetable symlink in the caller's
+        #     spelling cannot redirect the child's later lookup. A bare name IS the
+        #     normal shape here -- the macOS sandbox wrapper hands back "env" as
+        #     argv[0] and the Linux cgroup wrapper hands back "systemd-run" -- so the
+        #     search cannot simply be refused, and `execvpe` resolved a relative entry
+        #     against the child's cwd, i.e. the pinned workspace. An absolute entry
+        #     pointing INTO that workspace reaches the same binary by a different
+        #     spelling.
         # (c) The CHILD gets that same screened PATH. Resolving argv[0] here is
         #     not the last resolution that happens: `env` looks `sandbox-exec` up on
         #     PATH itself, inside the child, after the shim has already entered the
