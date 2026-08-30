@@ -1185,6 +1185,137 @@ async def test_sync_runner_pins_utf8_stdout_before_its_first_print():
     assert script.index("reconfigure(") < script.index("print(f'::step::")
 
 
+# --- backend-only sync: skip the frontend half at runtime (issue #7132) ---
+# PR #7123 removed the preflight's scratch npm ci on a website/-unchanged sync;
+# it deferred the larger two costs (the real npm ci reinstall and the vite
+# build+stage) because the skip has to be decided at RUNTIME (the diff evidence
+# needs the fetched ref on disk, which does not exist when the step list is
+# assembled). These pin that the two steps are still ASSEMBLED, that the runner
+# carries the runtime skip gated on sync_base_ref, that the two are COUPLED, and
+# that the edition path is untouched.
+
+
+@pytest.mark.asyncio
+async def test_sync_still_assembles_both_frontend_steps_on_a_stock_checkout():
+    """The skip is a RUNTIME decision, not an assembly-time omission.
+
+    Both frontend steps must still be in the step list on a stock checkout, in
+    their existing order, so the credential-tier and stash invariants that key
+    off them are unchanged; the runner is what decides at runtime whether to run
+    or skip them.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    labels = _steps_from_script(script)
+    assert "npm ci" in labels
+    assert "npm build + stage" in labels
+    # Order preserved: ci before build+stage, both after the merge.
+    assert labels.index("npm ci") < labels.index("npm build + stage")
+    assert labels.index("Merge") < labels.index("npm ci")
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_carries_the_runtime_frontend_skip_gated_on_the_base_ref():
+    """The generated runner evaluates the website/-diff skip against sync_base_ref.
+
+    The decision cannot be made at assembly time (the ref does not exist until
+    fetch runs inside this script), so it lives in the runner: a by-path load of
+    the stdlib-only helper and a call to may_skip_frontend, whose evidence is a
+    diff against the pinned base ref.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    # The runner loads the helper BY PATH (never imports kiro_crew) and asks it.
+    assert "spec_from_file_location('frontend_skip'" in script
+    assert "may_skip_frontend(" in script
+    # The skip is gated on the pinned base ref this process fetched into.
+    assert f"sync-base-{os.getpid()}" in script
+    # And it prints a skip notice naming website/ as the reason.
+    assert "skipping %s" in script and "website/" in script
+
+
+@pytest.mark.asyncio
+async def test_sync_couples_the_two_frontend_steps_under_one_skip_marker():
+    """Both frontend steps carry the SAME skip marker; nothing else does.
+
+    They share one cause (no website/ change) and one evidence check, so they
+    skip together or neither does. Every other step (fetch, merge, pip, the
+    preflight) must be free of the marker so it always runs.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    by_label = {s["label"]: s for s in steps}
+    marked = [s["label"] for s in steps if "skip_if_frontend_unchanged" in s]
+    assert sorted(marked) == ["npm build + stage", "npm ci"]
+    # The two markers are the SAME object of evidence (same ref/repo/git), which
+    # is what makes the runtime verdict one decision shared by both.
+    assert (
+        by_label["npm ci"]["skip_if_frontend_unchanged"]
+        == by_label["npm build + stage"]["skip_if_frontend_unchanged"]
+    )
+    # The marker carries the pinned base ref the runtime diff is taken against.
+    assert by_label["npm ci"]["skip_if_frontend_unchanged"]["ref"].endswith(
+        f"sync-base-{os.getpid()}"
+    )
+    # No non-frontend step is a skip candidate.
+    for label in ("Pull", "Merge", "pip install"):
+        assert "skip_if_frontend_unchanged" not in by_label[label]
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_skips_before_the_node_modules_stash_transaction():
+    """A skipped npm ci must not even move node_modules aside.
+
+    The whole point of the skip is that the tree is already what npm ci would
+    produce, so the runner `continue`s past the step BEFORE the stash rename —
+    otherwise a backend-only sync would still take the one trip through the step
+    that can destroy node_modules, which is the second-order cost the issue
+    calls out.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    # The skip `continue` appears before the stash rename in the step loop body.
+    skip_at = script.index("if marker and may_skip_frontend(marker)")
+    stash_at = script.index("os.rename(stash, backup)")
+    assert skip_at < stash_at
+
+
+@pytest.mark.asyncio
+async def test_sync_frontend_skip_is_a_no_op_on_an_edition_checkout():
+    """On an edition checkout the frontend steps are absent, so the skip cannot
+    fire and must not interfere.
+
+    frontend_half is false on an edition composition root, so neither npm step
+    is assembled and nothing carries the skip marker — the runtime skip is a
+    guarded no-op there. The backend half (fetch, merge, pip) is untouched.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with patch.object(mod.frontend, "edition_configured", return_value=True):
+        _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    labels = [s["label"] for s in steps]
+    # No frontend steps at all, hence nothing to skip.
+    assert "npm ci" not in labels
+    assert "npm build + stage" not in labels
+    assert not any("skip_if_frontend_unchanged" in s for s in steps)
+    # No step carries the marker, so the runner's `st.get(SKIP_MARKER)` is None
+    # for every step and may_skip_frontend is never invoked — a guarded no-op.
+    assert all(s.get("skip_if_frontend_unchanged") is None for s in steps)
+    # Backend half is still there.
+    assert "Pull" in labels and "Merge" in labels and "pip install" in labels
+
+
 def test_utf8_reconfigure_survives_a_legacy_codepage_pipe():
     """Prove the mechanism, not just its presence in the source.
 
