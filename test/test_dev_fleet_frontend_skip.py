@@ -45,13 +45,33 @@ def _write(path: Path, data: bytes) -> None:
     path.write_bytes(data)
 
 
-def _fake_repo(tmp_path: Path, *, lockfile: bytes, hidden: bytes | None) -> Path:
+def _stage_dist(repo: Path, *, index: bool = True) -> None:
+    """Populate the served bundle at src/kiro_crew/static/dist.
+
+    ``index=True`` writes the ``index.html`` resolution marker frontend.py
+    requires; ``index=False`` leaves the directory present but empty (the
+    interrupted-stage case)."""
+    static_dist = repo / "src" / "kiro_crew" / "static" / "dist"
+    static_dist.mkdir(parents=True, exist_ok=True)
+    if index:
+        (static_dist / "index.html").write_bytes(b"<!doctype html>")
+
+
+def _fake_repo(
+    tmp_path: Path, *, lockfile: bytes, hidden: bytes | None, dist: bool = True
+) -> Path:
     """A checkout whose website/ carries a lockfile and (optionally) an installed
-    tree recording the lockfile it was installed from."""
+    tree recording the lockfile it was installed from.
+
+    ``dist=True`` also stages a usable built bundle at static/dist so the
+    dist-presence precondition is satisfied; pass ``dist=False`` to exercise the
+    absent-dist guard."""
     website = tmp_path / "website"
     _write(website / "package-lock.json", lockfile)
     if hidden is not None:
         _write(website / "node_modules" / ".package-lock.json", hidden)
+    if dist:
+        _stage_dist(tmp_path)
     return tmp_path
 
 
@@ -176,6 +196,49 @@ def test_website_diff_uses_head_and_ref_scoped_to_website(patch_git, tmp_path):
     assert "--name-only" in argv
     assert "HEAD" in argv and "refs/kirocrew/sync-base-99" in argv
     assert "--" in argv and "website" in argv
+
+
+def test_does_not_skip_when_built_dist_absent(patch_git, tmp_path):
+    """Issue #7132's explicit case: the website/ diff is empty and all three
+    lockfiles match, but no built bundle exists at static/dist. Skipping would
+    leave the dashboard with no assets where every prior stock Pull+Build
+    rebuilt them, so the presence gate forces do-not-skip."""
+    repo = _fake_repo(tmp_path, lockfile=LOCK, hidden=LOCK, dist=False)
+    patch_git(_FakeGit(show=LOCK, diff_names=b""))
+    # The lockfile evidence is fully satisfied on its own...
+    assert fs.node_modules_matches_lockfile("git", str(repo), "refs/x") is True
+    assert fs.website_diff_is_empty("git", str(repo), "refs/x") is True
+    # ...yet the missing dist forces a build.
+    assert fs.built_dist_is_present(str(repo)) is False
+    assert fs.may_skip_frontend("git", str(repo), "refs/x") is False
+
+
+def test_does_not_skip_when_built_dist_has_no_index(patch_git, tmp_path):
+    """An interrupted stage can leave static/dist present but without the
+    index.html frontend.py resolves the bundle by. That is not a usable bundle,
+    so the presence gate still forces do-not-skip."""
+    repo = _fake_repo(tmp_path, lockfile=LOCK, hidden=LOCK, dist=False)
+    _stage_dist(repo, index=False)  # empty dist directory, no index.html
+    patch_git(_FakeGit(show=LOCK, diff_names=b""))
+    assert fs.built_dist_is_present(str(repo)) is False
+    assert fs.may_skip_frontend("git", str(repo), "refs/x") is False
+
+
+def test_built_dist_present_follows_symlink(tmp_path):
+    """On a source-tree install static/dist is a symlink to website/dist; the
+    Path.is_file() probe follows the link, so a symlinked bundle counts as
+    present -- matching how frontend.ensure_dev_dist_symlink resolves it."""
+    repo = _fake_repo(tmp_path, lockfile=LOCK, hidden=LOCK, dist=False)
+    website_dist = repo / "website" / "dist"
+    website_dist.mkdir(parents=True, exist_ok=True)
+    (website_dist / "index.html").write_bytes(b"<!doctype html>")
+    static_parent = repo / "src" / "kiro_crew" / "static"
+    static_parent.mkdir(parents=True, exist_ok=True)
+    try:
+        (static_parent / "dist").symlink_to(website_dist, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - symlink-less FS
+        pytest.skip("filesystem does not support symlinks")
+    assert fs.built_dist_is_present(str(repo)) is True
 
 
 def test_hidden_lockfile_match_is_a_real_sha256(patch_git, tmp_path):
