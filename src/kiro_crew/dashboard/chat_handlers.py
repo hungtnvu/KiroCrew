@@ -1437,6 +1437,146 @@ def _snapshot_slot_window(slot: "_ChatSlot") -> tuple[int, list[dict]]:
     return disk_older_count, window
 
 
+def _overlay_unflushed_edits(
+    all_msgs: list[dict],
+    window: list[dict],
+) -> list[dict]:
+    """Replace disk rows whose window twin carries an unflushed IN-PLACE edit.
+
+    The two slot-detail branches do not agree on which store is authoritative.
+    The unbounded branch returns ``older + list(slot.messages)``, so the WINDOW
+    decides a row's content; the bounded branch reads chained disk history, so
+    DISK does. That difference is invisible while the two agree, and they stop
+    agreeing the moment a row is rewritten in place and not yet flushed --
+    ``chat_regenerate`` sets ``_pending_rewrite`` and broadcasts
+    ``chat_variant_switch``, whose client-side refresh then reads through this
+    branch and paints the PREVIOUS variant back over the one just selected.
+
+    ``_append_unflushed_tail`` does not cover this: it appends rows the disk read
+    is MISSING, and a rewritten row is not missing -- it is present and stale, at
+    the same ``meta.mid``. So this is a substitution, not an append, and it leaves
+    the row COUNT untouched, which is what keeps ``total``, ``has_more`` and the
+    slice boundary exactly where they were.
+
+    Applied unconditionally rather than behind ``_pending_rewrite`` /
+    ``_dirty_flag``. Gating would re-introduce the question those flags already
+    make delicate elsewhere (they are checked on both sides of an await in
+    ``_reconcile_slot_from_disk`` for precisely this reason), and would leave a
+    third future flag uncovered. The window is the live authority for the current
+    session in every case, so preferring it is never wrong -- and a chained read
+    spanning OLDER sessions carries ids this window does not hold, so those rows
+    match nothing and pass through untouched.
+
+    ``window`` must come from the ``_snapshot_slot_window`` PAIR the caller
+    already captured on the event loop, for the tearing reason documented there.
+
+    An id substitutes only when it is UNAMBIGUOUS -- present exactly once in the
+    window AND exactly once in the disk read. ``meta.mid`` on an inbound message
+    is CALLER-supplied (one is minted only when absent), so a client can post the
+    same id twice, and a bare lookup then rewrites every disk row sharing that id
+    to the same window row -- duplicating content rather than refreshing it. This
+    is the same over-reach ``_append_unflushed_tail`` documents for a set
+    membership test, so it declines on the same terms: no id, or an id that cannot
+    name ONE row on both sides, is not proof the two rows are the same row, and
+    guessing would swap unrelated content.
+
+    Counting once on each side is still not IDENTITY. A chained read spans older
+    sessions, so a caller that reuses an id across two of them yields a disk row
+    and a window row that are genuinely different rows, each unique on its own
+    side -- and substituting there overwrites PERSISTED content with an unrelated
+    live row. The two rows must therefore corroborate before one stands in for the
+    other: same ``role``, and the same ``ts`` when both carry one.
+
+    ``ts`` is checked only when BOTH rows have one, which is deliberate and is the
+    same asymmetry the client's ``idAnchorsOneRow`` draws. Here a decline costs the
+    staleness this overlay exists to remove, so demanding a ``ts`` that legacy rows
+    never had would make the overlay dead code on exactly the transcripts that most
+    need it. A missing ``ts`` on either side is not evidence of a MISMATCH; a
+    differing one is. Content is deliberately not compared -- an in-place variant
+    rewrite changes the body, so body equality would reject the one case this
+    helper is for.
+
+    A DIFFERING ``ts`` is not final either, because a variant switch rewrites it:
+    ``api_chat_slot_switch_variant`` assigns ``target["ts"] = chosen["ts"]``, so the
+    selected variant carries the timestamp of the variant, not of the row. Rejecting
+    on that alone would decline the exact case this overlay exists for -- switch,
+    failed save, bounded refresh, stale content repainted -- so variant metadata
+    corroborates first. The rows are the same logical message when one side's ``ts``
+    appears among the other side's ``variants`` entries: that list is the row's own
+    history of (content, ts) pairs, so a hit there is positive evidence of identity,
+    not merely the absence of a contradiction. Checked in BOTH directions, since
+    which side holds the fuller list depends on which store was written last.
+    """
+
+    def _mid(row: dict) -> str | None:
+        meta = row.get("meta")
+        if not isinstance(meta, dict):
+            return None
+        mid = meta.get("mid")
+        return mid if isinstance(mid, str) and mid else None
+
+    live: dict[str, dict] = {}
+    ambiguous: set[str] = set()
+    for row in window:
+        mid = _mid(row)
+        if mid is None:
+            continue
+        if mid in live:
+            ambiguous.add(mid)
+            continue
+        live[mid] = row
+    if not live:
+        return all_msgs
+    disk_seen: dict[str, int] = {}
+    for row in all_msgs:
+        mid = _mid(row)
+        if mid is not None:
+            disk_seen[mid] = disk_seen.get(mid, 0) + 1
+
+    def _variant_stamps(row: dict) -> set[str]:
+        """Every ``ts`` this row has worn across its recorded variants."""
+        raw = row.get("variants")
+        if not isinstance(raw, list):
+            return set()
+        out: set[str] = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            ts = entry.get("ts")
+            if isinstance(ts, str) and ts:
+                out.add(ts)
+        return out
+
+    def _corroborates(disk_row: dict, live_row: dict) -> bool:
+        """Are these plausibly the SAME row, rewritten -- not two rows sharing an id?"""
+        if disk_row.get("role") != live_row.get("role"):
+            return False
+        disk_ts, live_ts = disk_row.get("ts"), live_row.get("ts")
+        has_both = isinstance(disk_ts, str) and disk_ts and isinstance(live_ts, str) and live_ts
+        if not has_both:
+            # No contradiction available; a legacy row without a ``ts`` must not be
+            # locked out of the overlay it most needs.
+            return True
+        if disk_ts == live_ts:
+            return True
+        # A variant switch rewrites ``ts``, so a differing one is only a mismatch
+        # when neither side's variant history accounts for the other's stamp.
+        return live_ts in _variant_stamps(disk_row) or disk_ts in _variant_stamps(live_row)
+
+    out: list[dict] = []
+    for row in all_msgs:
+        mid = _mid(row)
+        if mid is None or mid in ambiguous or disk_seen.get(mid, 0) != 1:
+            out.append(row)
+            continue
+        replacement = live.get(mid)
+        if replacement is None or not _corroborates(row, replacement):
+            out.append(row)
+            continue
+        out.append(replacement)
+    return out
+
+
 def _append_unflushed_tail(
     slot: "_ChatSlot",
     all_msgs: list[dict],
@@ -1880,6 +2020,10 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         all_msgs = await asyncio.to_thread(
             _append_unflushed_tail, slot, all_msgs, snapshot=tail_snapshot
         )
+        # The disk read is authoritative for POSITION here but not for CONTENT: a
+        # row the window rewrote in place and has not flushed is present on disk in
+        # its previous form. Same snapshot pair, so no new tearing surface.
+        all_msgs = await asyncio.to_thread(_overlay_unflushed_edits, all_msgs, tail_snapshot[1])
         # One row must mean one displayed message BEFORE `limit` is applied. The
         # owed rows above can include `chunk`/`streaming`, and a segment still
         # streaming is hundreds of rows that render as one message, so slicing
