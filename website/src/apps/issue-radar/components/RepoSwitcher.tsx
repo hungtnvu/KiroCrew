@@ -5,7 +5,7 @@ import {
 } from '../../../components/ui/dropdown-menu'
 import { ProviderLogo, ProviderHostTag } from './ProviderBadge'
 import { useIssueRadar } from '../context'
-import { sameRepoRef } from '../lib/links'
+import { repoScopeKey, sameRepoRef } from '../lib/links'
 import type { RepoRef } from '../api'
 import ReadOnlyTag, { isReadOnly } from './ReadOnlyTag'
 
@@ -105,7 +105,7 @@ export default function RepoSwitcher() {
             <DropdownMenuItem
               // Keyed on the full identity so two same-slug repos on different
               // providers are distinct rows rather than a React key collision.
-              key={`${r.provider || 'github'}:${r.host || 'github.com'}:${r.owner}/${r.repo}`}
+              key={repoScopeKey(r)}
               onSelect={() => switchRepo({
                 owner: r.owner,
                 repo: r.repo,

@@ -461,10 +461,7 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
             // Only when it actually differs, though — switchRepo resets the saved
             // issue and PR filters, which would be a surprising side effect of
             // navigating within the repo you are already on.
-            const sameActive = active.owner === owner
-              && active.repo === repo
-              && (active.provider || 'github') === (repoRef.provider || 'github')
-              && (active.host || 'github.com') === (repoRef.host || 'github.com')
+            const sameActive = sameRepoRef(active, repoRef)
             if (!sameActive) switchRepo(repoRef)
             openDashboard('tagging')
           }}
