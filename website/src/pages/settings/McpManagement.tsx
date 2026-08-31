@@ -10,7 +10,7 @@ import {
   type McpShareRecommendation,
   type McpShareReason,
 } from '../../api/client'
-import UnderlineTabs, { type UnderlineTab } from '../../components/UnderlineTabs'
+import { Tabs, TabsContent, TabsCount, TabsList, TabsTrigger, type TabItem } from '../../components/ui/tabs'
 import { Btn } from '../../components/ui'
 import {
   Dialog,
@@ -929,7 +929,7 @@ export function McpManagement() {
   const [view, setView] = useState<McpView>('servers')
   // A function, not a module constant, so the labels re-translate on a language
   // switch instead of freezing at first import.
-  const views: Array<UnderlineTab<McpView>> = [
+  const views: Array<TabItem<McpView>> = [
     {
       key: 'servers',
       label: i18nT('pages.mcpManagement.view_servers'),
@@ -947,16 +947,23 @@ export function McpManagement() {
   ]
 
   return (
-    <div className="space-y-4">
-      <UnderlineTabs<McpView>
-        tabs={views}
-        value={view}
-        onChange={setView}
-        ariaLabel={i18nT('pages.mcpManagement.views_aria')}
-        layoutId="mcp-management-view"
-      />
+    <Tabs
+      value={view}
+      onValueChange={v => setView(v as McpView)}
+      layoutId="mcp-management-view"
+      className="space-y-4"
+    >
+      <TabsList aria-label={i18nT('pages.mcpManagement.views_aria')}>
+        {views.map(v => (
+          <TabsTrigger key={v.key} value={v.key}>
+            {v.icon}
+            <span>{v.label}</span>
+            <TabsCount value={v.count} />
+          </TabsTrigger>
+        ))}
+      </TabsList>
 
-      {view === 'assessment' ? (
+      <TabsContent value="assessment">
         <AssessmentView
           servers={servers}
           sharingOn={!!status?.enabled}
@@ -966,8 +973,8 @@ export function McpManagement() {
           unsupportedCount={unsupportedCount}
           unmeasuredCount={unmeasuredCount}
         />
-      ) : (
-        <>
+      </TabsContent>
+      <TabsContent value="servers">
       {/* No <h2> here: the Developer tab header already names this surface, and a
           second copy of the title read as two stacked headings. */}
       <header>
@@ -1310,8 +1317,7 @@ export function McpManagement() {
           {i18nT('pages.mcpManagement.state_direct_env_legend')}
         </div>
       </section>
-        </>
-      )}
+      </TabsContent>
 
       <ConfirmSharing
         open={confirmSharing}
@@ -1324,7 +1330,7 @@ export function McpManagement() {
           setSharing.mutate(true)
         }}
       />
-    </div>
+    </Tabs>
   )
 }
 
