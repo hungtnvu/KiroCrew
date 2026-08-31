@@ -20,6 +20,7 @@ import subprocess
 import sys
 from typing import Any
 
+from kiro_crew.security import redact_and_truncate
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
@@ -111,5 +112,11 @@ def install_deps() -> dict[str, Any]:
         return {"ok": False, "installed": [], "error": f"install failed: {exc}"}
     if proc.returncode != 0:
         tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
-        return {"ok": False, "installed": [], "error": f"pip failed: {tail[0][:200]}"}
+        # pip inherits the gateway environment, so an authenticated private
+        # index echoes its request URL — token and all — to stderr on an auth
+        # failure. This payload surfaces in the dashboard, so scrub the full
+        # tail line before it is bounded: redact_and_truncate redacts over the
+        # whole string first, so a credential straddling the 200-char boundary
+        # cannot leak as an unredacted fragment (bound-before-redact would).
+        return {"ok": False, "installed": [], "error": f"pip failed: {redact_and_truncate(tail[0], 200)}"}
     return {"ok": True, "installed": ["ruff"], "detail": "ruff installed"}

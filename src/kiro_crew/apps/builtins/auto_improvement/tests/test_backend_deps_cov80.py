@@ -224,6 +224,47 @@ class TestInstallDeps:
         out = deps.install_deps()
         assert out["error"] == "pip failed: " + "x" * 200
 
+    def test_a_pip_failure_does_not_leak_index_credentials_to_the_payload(
+        self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The child pip inherits the gateway env, so an authenticated private
+        index reaches it; on an auth failure pip echoes the raw request URL —
+        token and all — to stderr. That tail line is returned in the handler's
+        ``error`` payload, which surfaces in the dashboard, so the token must
+        never survive into it.
+        """
+        token = "s3cr3t-index-token"  # a fake secret, only asserted absent
+        stderr = (
+            "WARNING: Retrying (Retry(total=0)) after connection broken\n"
+            f"ERROR: Could not install ruff from "
+            f"https://ci-bot:{token}@pypi.internal.example.com/simple/ruff/\n"
+        )
+        monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1, stderr=stderr))
+        out = deps.install_deps()
+        assert out["ok"] is False
+        assert out["installed"] == []
+        assert token not in out["error"]
+        assert "[REDACTED" in out["error"]
+
+    def test_a_pip_failure_credential_is_redacted_before_it_is_bounded(
+        self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redact-before-bound invariant: with the credential pushed so its tail
+        straddles the 200-char slice, a bound-before-redact fix would leave an
+        unredacted prefix fragment. Redacting the full line first prevents that.
+        """
+        token = "TOKENedge9876543210"  # a fake secret, only asserted absent
+        # Pad so the credential sits right on the 200-char boundary.
+        prefix = "ERROR: " + "pad " * 45
+        stderr = f"{prefix}https://ci-bot:{token}@pypi.internal.example.com/simple/ruff/\n"
+        monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1, stderr=stderr))
+        out = deps.install_deps()
+        assert out["ok"] is False
+        assert token not in out["error"]
+        # No partial fragment of the token survives either.
+        for frag_len in (12, 8, 6):
+            assert token[:frag_len] not in out["error"]
+
     @pytest.mark.parametrize(
         "exc",
         [OSError("no pip"), subprocess.TimeoutExpired(cmd="pip", timeout=300.0)],
