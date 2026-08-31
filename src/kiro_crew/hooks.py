@@ -3084,8 +3084,70 @@ def _normalize_hook_timeout(value: object) -> int:
     return max(HOOK_TIMEOUT_MIN, min(HOOK_TIMEOUT_MAX, ivalue))
 
 
+# Per-hook fail-direction spellings for ``ScriptHook.on_error``. ``fail_closed``
+# blocks the tool when the hook cannot deliver a verdict (timeout, crash, or a
+# missing/non-runnable binary); ``fail_open`` restores the historical
+# pass-through. ``""`` is the sentinel that means "use the event default" —
+# stored verbatim so the effective direction is resolved at read time against
+# the hook's event (PreToolUse -> fail_closed, everything else -> fail_open).
+HOOK_ON_ERROR_FAIL_CLOSED = "fail_closed"
+HOOK_ON_ERROR_FAIL_OPEN = "fail_open"
+HOOK_ON_ERROR_DEFAULT = ""  # sentinel: resolve against the event at read time
+_HOOK_ON_ERROR_VALUES = (
+    HOOK_ON_ERROR_DEFAULT,
+    HOOK_ON_ERROR_FAIL_CLOSED,
+    HOOK_ON_ERROR_FAIL_OPEN,
+)
+
+
+def _normalize_hook_on_error(value: object) -> str:
+    """Coerce a persisted/edited ``on_error`` to one of the accepted spellings.
+
+    ``hooks.json`` is hand-editable and older files predate this field, so a
+    missing / non-string / unrecognized value must degrade to the sentinel
+    ``""`` (use the event default) rather than propagate — the same fail-soft
+    contract ``_normalize_hook_timeout`` / ``_coerce_bool`` follow on load. The
+    raising ``validate_hook_fields`` is what rejects a bad EXPLICIT value at the
+    create/update boundary. Degrading to the sentinel is safe because the
+    sentinel resolves to fail_closed for PreToolUse (the gating event), so junk
+    on a policy hook still fails toward MORE protection, per the deny-by-default
+    tenet. A recognized spelling is matched case-insensitively after trimming.
+    """
+    if not isinstance(value, str):
+        return HOOK_ON_ERROR_DEFAULT
+    v = value.strip().lower()
+    if v in (HOOK_ON_ERROR_FAIL_CLOSED, HOOK_ON_ERROR_FAIL_OPEN):
+        return v
+    return HOOK_ON_ERROR_DEFAULT
+
+
+def _resolve_on_error(on_error: str, event: str) -> str:
+    """Resolve the sentinel ``on_error`` to a concrete fail direction.
+
+    An explicit ``fail_closed`` / ``fail_open`` is honored as written; the
+    sentinel ``""`` resolves to ``fail_closed`` for PreToolUse (the only event
+    that gates a tool) and ``fail_open`` for every other event (they do not
+    gate, so a failed run there is informational and must not manufacture a
+    block).
+    """
+    if on_error in (HOOK_ON_ERROR_FAIL_CLOSED, HOOK_ON_ERROR_FAIL_OPEN):
+        return on_error
+    return (
+        HOOK_ON_ERROR_FAIL_CLOSED
+        if event == HOOK_EVENT_PRE_TOOL_USE
+        else HOOK_ON_ERROR_FAIL_OPEN
+    )
+
+
 def validate_hook_fields(
-    *, event: str, timeout: object, command: str, skills: list, matcher: str, matcher_mode: str
+    *,
+    event: str,
+    timeout: object,
+    command: str,
+    skills: list,
+    matcher: str,
+    matcher_mode: str,
+    on_error: str = HOOK_ON_ERROR_DEFAULT,
 ) -> None:
     """Enforce the script-hook invariants at a WRITE boundary, raising on any breach.
 
@@ -3105,10 +3167,18 @@ def validate_hook_fields(
     * ``skills`` is combined with a ``command`` (the skills would never fire);
     * ``skills`` is paired with an event other than UserPromptSubmit/AgentSpawn
       (the "Load skills:" directive has no consumer there);
-    * ``matcher_mode`` is ``regex`` with a syntactically invalid ``matcher``.
+    * ``matcher_mode`` is ``regex`` with a syntactically invalid ``matcher``;
+    * ``on_error`` is not one of ``""`` / ``fail_closed`` / ``fail_open`` (an
+      explicit but misspelled fail direction is rejected rather than silently
+      degraded — unlike ``from_dict``, which is fail-soft on load).
     """
     if event not in HOOK_EVENTS:
         raise ValueError(f"invalid event: {event}")
+    if on_error not in _HOOK_ON_ERROR_VALUES:
+        raise ValueError(
+            f"on_error must be one of {HOOK_ON_ERROR_FAIL_CLOSED!r}, "
+            f"{HOOK_ON_ERROR_FAIL_OPEN!r}, or empty for the event default"
+        )
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not (
         HOOK_TIMEOUT_MIN <= timeout <= HOOK_TIMEOUT_MAX
     ):
@@ -3226,6 +3296,17 @@ class ScriptHook:
     - Exit 0: success (stdout → context for AgentSpawn/UserPromptSubmit)
     - Exit 2: block tool (PreToolUse only, stderr → LLM)
     - Other: warning (stderr shown to user)
+
+    Fail direction (``on_error``): when a hook CANNOT deliver a verdict — it
+    times out, crashes, or its binary is missing/non-runnable — the auto-approve
+    GATE must decide whether that ambiguity blocks the tool or lets it through.
+    PreToolUse defaults to fail_closed (block: an unheard policy hook must not
+    silently auto-approve a tool), every other event defaults to fail_open (they
+    do not gate a tool, so a failed run there is informational only). ``on_error``
+    stores the operator's explicit override; the sentinel ``""`` means "use the
+    event default", resolved at read time by ``effective_on_error``. This field
+    ONLY affects the fail-direction of the auto-approve gate — it never turns a
+    non-gating event (UserPromptSubmit/AgentSpawn/PostToolUse/Stop) into a gate.
     """
 
     id: str = ""
@@ -3241,6 +3322,22 @@ class ScriptHook:
     last_status: str = ""  # "ok", "error", "timeout", "blocked"
     last_error: str = ""  # human-readable reason for the most recent non-ok status
     run_count: int = 0
+    # Fail direction for a hook that cannot deliver a verdict. "" = use the event
+    # default (PreToolUse -> fail_closed, else fail_open); "fail_closed" blocks
+    # the tool on timeout/crash/missing-binary; "fail_open" restores the historic
+    # pass-through. Declared last so existing positional construction keeps
+    # working. Resolve via effective_on_error(); never gate on the raw value.
+    on_error: str = HOOK_ON_ERROR_DEFAULT
+
+    def effective_on_error(self) -> str:
+        """Resolve ``on_error`` to a concrete ``fail_closed`` / ``fail_open``.
+
+        The sentinel ``""`` resolves against ``self.event`` (fail_closed for
+        PreToolUse, fail_open otherwise); an explicit value is honored as
+        written. This is the ONLY correct way to read the fail direction — the
+        raw ``on_error`` carries the sentinel a gate cannot act on directly.
+        """
+        return _resolve_on_error(self.on_error, self.event)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -3272,6 +3369,14 @@ class ScriptHook:
         # written so an unknown event is visibly inert rather than silently
         # remapped, matching how `matcher_mode` junk falls through to glob.
         timeout = _normalize_hook_timeout(data.get("timeout", HOOK_TIMEOUT_DEFAULT))
+        # Normalize the fail direction on load. hooks.json is hand-editable and
+        # older files predate this field, so a missing / non-string / junk value
+        # degrades to the sentinel "" (use the event default) rather than raising
+        # — deserialization stays fail-soft, matching timeout/enabled above. The
+        # sentinel resolves to fail_closed for PreToolUse, so junk on a policy
+        # hook still fails toward MORE protection. The raising validate_hook_fields
+        # is what rejects a bad explicit value at the create/update boundary.
+        on_error = _normalize_hook_on_error(data.get("on_error", HOOK_ON_ERROR_DEFAULT))
         return cls(
             id=data.get("id", str(uuid.uuid4())[:8]),
             name=data.get("name", ""),
@@ -3286,6 +3391,7 @@ class ScriptHook:
             last_status=data.get("last_status", ""),
             last_error=last_error,
             run_count=data.get("run_count", 0),
+            on_error=on_error,
         )
 
 
@@ -3414,6 +3520,13 @@ class ScriptHookResult:
     exit_code: int = -1
     error: str = ""
     duration_ms: int = 0
+    # Resolved fail direction for the hook that produced this result, threaded on
+    # at creation time (in run_script_hook / fire) so a consumer — e.g. the
+    # dashboard _fire gate — can decide the fail-direction WITHOUT looking the
+    # ScriptHook back up. "" only for a result built outside the normal fire path
+    # (e.g. a hand-constructed test result); consumers must resolve "" against the
+    # event before gating. See ScriptHook.effective_on_error / _resolve_on_error.
+    on_error: str = HOOK_ON_ERROR_DEFAULT
 
     @property
     def blocked(self) -> bool:
@@ -3423,6 +3536,42 @@ class ScriptHookResult:
     @property
     def succeeded(self) -> bool:
         return self.exit_code == 0
+
+    @property
+    def failed_to_run(self) -> bool:
+        """True when the hook did NOT deliver a clean gate signal.
+
+        A clean signal is exit 0 (allow) or exit 2 (block). Anything else means
+        the hook could not render a verdict: the timeout branch and the generic
+        exception branch return the default exit_code -1, and a missing/non-
+        runnable binary surfaces as 127 — all of which land here. A non-empty
+        ``error`` with a non-2 exit code is also treated as failed_to_run so a
+        governance/setup error that never reached exit 0/2 is caught too. This
+        is the signal a fail_closed PreToolUse gate blocks on; it is deliberately
+        distinct from ``blocked`` (a clean, intentional exit-2 denial).
+        """
+        if self.exit_code in (0, 2):
+            return False
+        return True
+
+    def should_block_pre_tool_use(self, on_error: str = "") -> bool:
+        """Whether this result must block the tool on the auto-approve gate.
+
+        Decision table (PreToolUse only — non-gating events never block here):
+        exit 2 -> block (a clean denial); clean exit 0 -> allow; failed_to_run ->
+        block iff the resolved fail direction is fail_closed. The direction is
+        taken from *on_error* when the caller passes one, else from the value
+        threaded onto this result, resolved against the result's event so the
+        sentinel is never acted on directly.
+        """
+        if self.blocked:
+            return True
+        if self.succeeded:
+            return False
+        if not self.failed_to_run:
+            return False
+        resolved = _resolve_on_error(on_error or self.on_error, self.event)
+        return resolved == HOOK_ON_ERROR_FAIL_CLOSED
 
 
 def _script_hooks_capability_denied(session_key: str = "") -> str | None:
@@ -3513,6 +3662,7 @@ async def run_script_hook(
             error=f"Blocked by governance policy: {gov_denied}",
             exit_code=2,  # PreToolUse "block tool" convention
             duration_ms=int((time.monotonic() - start) * 1000),
+            on_error=hook.effective_on_error(),
         )
     # Build hook event JSON for STDIN
     if hook_event is None:
@@ -3640,6 +3790,7 @@ async def run_script_hook(
             stderr=stderr_safe_full,
             exit_code=exit_code,
             duration_ms=elapsed,
+            on_error=hook.effective_on_error(),
         )
     except asyncio.TimeoutError:
         # Kill the whole process tree (shell + grandchildren) to prevent orphans.
@@ -3674,6 +3825,7 @@ async def run_script_hook(
             event=hook.event,
             error=f"Timed out after {hook.timeout}s",
             duration_ms=elapsed,
+            on_error=hook.effective_on_error(),
         )
     except Exception as exc:
         elapsed = int((time.monotonic() - start) * 1000)
@@ -3688,6 +3840,7 @@ async def run_script_hook(
             event=hook.event,
             error=safe_error,
             duration_ms=elapsed,
+            on_error=hook.effective_on_error(),
         )
 
 
@@ -3872,6 +4025,7 @@ class ScriptHookStore:
             skills=hook.skills,
             matcher=hook.matcher,
             matcher_mode=hook.matcher_mode,
+            on_error=hook.on_error,
         )
         with self._mutex, self._atomic_mutation():
             self._hooks[hook.id] = hook
@@ -3883,7 +4037,16 @@ class ScriptHookStore:
             hook = self._hooks.get(hook_id)
             if not hook:
                 return None
-            for k in ("name", "event", "matcher", "matcher_mode", "command", "timeout", "enabled"):
+            for k in (
+                "name",
+                "event",
+                "matcher",
+                "matcher_mode",
+                "command",
+                "timeout",
+                "enabled",
+                "on_error",
+            ):
                 if k in data:
                     setattr(hook, k, data[k])
             if "skills" in data:
@@ -3904,6 +4067,7 @@ class ScriptHookStore:
                 skills=hook.skills,
                 matcher=hook.matcher,
                 matcher_mode=hook.matcher_mode,
+                on_error=hook.on_error,
             )
             self._save()
         return hook
@@ -4044,6 +4208,7 @@ class ScriptHookStore:
                     stdout=f"Load skills: {skills_directive}",
                     exit_code=0,
                     duration_ms=0,
+                    on_error=hook.effective_on_error(),
                 )
                 results.append(result)
                 logger.info(

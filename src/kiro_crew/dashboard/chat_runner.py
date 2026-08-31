@@ -4680,8 +4680,44 @@ async def _run_chat(
                             "text": f"Hook {r.hook_name} BLOCKED: {r.stderr[:100] if r.stderr else 'denied'}",
                         },
                     )
+                elif (
+                    event == HOOK_EVENT_PRE_TOOL_USE
+                    and r.failed_to_run
+                    and r.should_block_pre_tool_use()
+                ):
+                    # Fail-closed gate: a PreToolUse hook that could not deliver a
+                    # verdict (timeout, crash, or missing/non-runnable binary —
+                    # exit_code neither 0 nor 2) must BLOCK the tool when its
+                    # resolved fail direction is fail_closed, not be silently
+                    # dropped as a warning (the historic fail-OPEN bug, #7339). We
+                    # emit the same BLOCKED:<name>:<reason> marker exit 2 does so
+                    # _pre_tool_hooks_should_block sees it. A hook explicitly set
+                    # to on_error='fail_open' resolves to allow here and falls
+                    # through to the warning branch below, restoring old behavior.
+                    reason = (
+                        (r.error or r.stderr or "").strip()[:200]
+                        or "hook failed to deliver a verdict (fail-closed)"
+                    )
+                    injected.append(f"BLOCKED:{r.hook_name}:{reason}")
+                    logger.warning(
+                        "Hook %s failed to deliver a verdict (exit=%s) - "
+                        "blocking tool (fail-closed): %s",
+                        r.hook_name,
+                        r.exit_code,
+                        reason,
+                    )
+                    state.broadcast_ws(
+                        "activity_event",
+                        {
+                            "slot": slot.key,
+                            "kind": "hook",
+                            "text": f"Hook {r.hook_name} BLOCKED (fail-closed): {reason[:100]}",
+                        },
+                    )
                 elif r.exit_code not in (0, 2) and r.stderr:
-                    # Non-zero, non-block: show warning
+                    # Non-zero, non-block: show warning. This is now reached only
+                    # for a non-gating event, or for a PreToolUse hook whose
+                    # resolved fail direction is fail_open (pass-through).
                     logger.warning("Hook %s warning: %s", r.hook_name, r.stderr[:200])
         except Exception as exc:
             if event == HOOK_EVENT_PRE_TOOL_USE:
