@@ -114,9 +114,12 @@ def install_deps() -> dict[str, Any]:
         tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
         # pip inherits the gateway environment, so an authenticated private
         # index echoes its request URL — token and all — to stderr on an auth
-        # failure. This payload surfaces in the dashboard, so scrub the full
-        # tail line before it is bounded: redact_and_truncate redacts over the
-        # whole string first, so a credential straddling the 200-char boundary
-        # cannot leak as an unredacted fragment (bound-before-redact would).
-        return {"ok": False, "installed": [], "error": f"pip failed: {redact_and_truncate(tail[0], 200)}"}
+        # failure. The dashboard route that serves this payload redacts what
+        # it sends, but its regexes need the full credential shape to match:
+        # bounding first can cut a token mid-match, leaving a fragment no
+        # downstream pass can recognise. redact_and_truncate scrubs the whole
+        # line BEFORE its bound, so a recognised credential straddling the
+        # 200-char boundary cannot leak as an unredacted partial.
+        safe_tail = redact_and_truncate(tail[0], 200)
+        return {"ok": False, "installed": [], "error": f"pip failed: {safe_tail}"}
     return {"ok": True, "installed": ["ruff"], "detail": "ruff installed"}

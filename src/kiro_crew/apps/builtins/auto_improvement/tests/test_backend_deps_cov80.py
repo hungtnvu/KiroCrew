@@ -249,21 +249,34 @@ class TestInstallDeps:
     def test_a_pip_failure_credential_is_redacted_before_it_is_bounded(
         self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Redact-before-bound invariant: with the credential pushed so its tail
-        straddles the 200-char slice, a bound-before-redact fix would leave an
-        unredacted prefix fragment. Redacting the full line first prevents that.
+        """Redact-before-bound invariant: the credential is laid out so the
+        200-char bound falls INSIDE the token. Bound-before-redact would keep
+        an unredacted token prefix that no longer matches the credential regex
+        — the exact fragment shape the serving route's own redaction pass
+        cannot recognise — so this test goes red if the redact and the bound
+        are ever reordered.
         """
         token = "TOKENedge9876543210"  # a fake secret, only asserted absent
-        # Pad so the credential sits right on the 200-char boundary.
-        prefix = "ERROR: " + "pad " * 45
-        stderr = f"{prefix}https://ci-bot:{token}@pypi.internal.example.com/simple/ruff/\n"
+        userinfo = "https://ci-bot:"
+        # Lay the token out to START at index 190 of the tail line, so the
+        # 200-char bound cuts ten characters into it.
+        pad = "x" * (190 - len("ERROR: ") - len(userinfo))
+        line = f"ERROR: {pad}{userinfo}{token}@pypi.internal.example.com/simple/ruff/"
+        stderr = f"warming up\n{line}\n"
+        # Premise guards: the guarded line must be the tail line the bound is
+        # actually applied to, and the token must straddle the boundary — or
+        # this test silently stops pinning the invariant.
+        assert stderr.strip().splitlines()[-1] == line
+        start = line.index(token)
+        assert start < 200 < start + len(token)
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1, stderr=stderr))
         out = deps.install_deps()
         assert out["ok"] is False
         assert token not in out["error"]
-        # No partial fragment of the token survives either.
-        for frag_len in (12, 8, 6):
-            assert token[:frag_len] not in out["error"]
+        # The exact fragment a bound-before-redact implementation would leak —
+        # everything of the token left of the bound — must be absent too.
+        leaked_prefix = token[: 200 - start]
+        assert leaked_prefix and leaked_prefix not in out["error"]
 
     @pytest.mark.parametrize(
         "exc",
