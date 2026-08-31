@@ -136,6 +136,13 @@ export class HeightIndex {
   private heightAt(index: number): number {
     const key = this.keyAt(index)
     if (key === null) return this.estimate
+    // The key resolved from a LIVE row index, which falsifies the premise of any
+    // retirement it carries (see HeightCache.retire): the row is in the list
+    // again -- an optimistically removed row the server refused, restored
+    // wholesale. Revived here rather than at the removal site because a restore
+    // has no commit shape of its own to hook (a tail truncation comes back as a
+    // plain append), and this read is the one place a live row is named.
+    this.cache.reviveIfRetired(key)
     const cached = this.cache.peek(key)
     if (cached !== undefined) return Math.max(cached, 1)
     return this.cache.averageHeight(this.estimate)
@@ -161,6 +168,20 @@ export class HeightIndex {
     const key = this.keyAt(index)
     if (key === null) return
     this.cache.set(key, height)
+  }
+
+  /**
+   * Retire measurements for rows that have LEFT the list, so their heights stop
+   * pricing the unmeasured rows that remain. The measurements are KEPT and only
+   * dropped from the mean, so an optimistic removal that gets rolled back
+   * restores exact geometry -- see HeightCache.retire.
+   *
+   * Deliberately does NOT sync or announce: the caller retires during the render
+   * that dropped the rows and the tree is re-synced in that same render, so the
+   * reprice lands in the commit whose shift is already compensated.
+   */
+  retire(keys: Iterable<string>): void {
+    for (const key of keys) this.cache.retire(key)
   }
 
   /**

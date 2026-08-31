@@ -400,4 +400,35 @@ describe('HeightIndex announces geometry changes (store contract)', () => {
     // The announcement still happened -- only delivery to this listener stopped.
     expect(idx.getVersion()).toBe(2)
   })
+
+  // A retired measurement is one whose row left the list. Asking for the
+  // resolved height of a LIVE index that maps to it is proof the row is back --
+  // the shape a refused regenerate/edit-resend produces when it restores its
+  // snapshot -- so the owner revives it there rather than waiting for a
+  // re-measure that an off-window row never gets.
+  it('revives a retired row through the resolved-height read', () => {
+    // `plain` is never measured, so its resolved height IS the mean -- which is
+    // what the retirement moves and what a revive has to move back.
+    const rows = [{ id: 'a' }, { id: 'b' }, { id: 'tall' }, { id: 'plain' }]
+    const idx = new HeightIndex('revive-on-read', {
+      rowCount: rows.length,
+      estimate: 80,
+      keyAt: (i) => rows[i]?.id ?? null,
+    })
+    idx.setMeasured(0, 300)
+    idx.setMeasured(1, 300)
+    idx.setMeasured(2, 900)
+    expect(idx.getHeight(3)).toBeCloseTo((300 + 300 + 900) / 3, 5)
+
+    // The tall row leaves the list, so its height stops pricing what remains.
+    rows.splice(2, 1)
+    idx.retire(['tall'])
+    expect(idx.getHeight(2)).toBe(300)
+
+    // It comes back: the resolved read for its live index revives it, so its own
+    // measurement is exact again AND it prices the unmeasured row again.
+    rows.splice(2, 0, { id: 'tall' })
+    expect(idx.getHeight(2)).toBe(900)
+    expect(idx.getHeight(3)).toBeCloseTo((300 + 300 + 900) / 3, 5)
+  })
 })

@@ -540,4 +540,107 @@ describe('HeightCache: access-recency eviction', () => {
     expect(c.get('k5')).toBeUndefined()
     expect(c.get('n2')).toBe(9002)
   })
+
+  // ---- retire(): out of the mean, still in the cache (issue #6076) ----------
+  //
+  // A row leaving the list must stop pricing the rows that remain, but "leaving"
+  // is not always permanent: an optimistically truncated transcript is restored
+  // wholesale when the server refuses the press. Deleting the measurement would
+  // re-price those rows from the mean on the way back -- wrong spacers and a
+  // viewport jump, the failure this cache exists to prevent.
+
+  it('retire drops a key from the mean but keeps its measurement readable', () => {
+    const c = new HeightCache('retire-mean')
+    c.set('a', 300)
+    c.set('b', 300)
+    c.set('ghost', 20)
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 20) / 3, 5)
+
+    c.retire('ghost')
+
+    // Out of the mean: unmeasured rows are priced by the two real messages.
+    expect(c.averageHeight()).toBe(300)
+    // Still readable: a restored row resolves its own exact height.
+    expect(c.peek('ghost')).toBe(20)
+    expect(c.get('ghost')).toBe(20)
+  })
+
+  it('retire is idempotent and ignores a key it never measured', () => {
+    const c = new HeightCache('retire-idem')
+    c.set('a', 300)
+    c.set('b', 100)
+    c.retire('b')
+    c.retire('b')
+    c.retire('never-measured')
+    expect(c.averageHeight()).toBe(300)
+    expect(c.peek('b')).toBe(100)
+  })
+
+  it('measuring a retired row again revives it into the mean', () => {
+    const c = new HeightCache('retire-revive')
+    c.set('a', 300)
+    c.set('ghost', 20)
+    c.retire('ghost')
+    expect(c.averageHeight()).toBe(300)
+
+    // The row is back and mounted, so its measurement counts again.
+    c.set('ghost', 20)
+    expect(c.averageHeight()).toBeCloseTo((300 + 20) / 2, 5)
+  })
+
+  it('falls back to the estimate when every measured row is retired', () => {
+    const c = new HeightCache('retire-all')
+    c.set('a', 300)
+    c.retire('a')
+    // n would be 0 here: the mean has no sample, so the caller's estimate wins
+    // rather than a division by zero.
+    expect(c.averageHeight(77)).toBe(77)
+  })
+
+  it('does not persist a retired key, so a reload cannot re-price from it', () => {
+    const c = new HeightCache('retire-persist')
+    c.set('a', 300)
+    c.set('ghost', 20)
+    c.retire('ghost')
+    c.flush()
+
+    const reloaded = new HeightCache('retire-persist')
+    expect(reloaded.peek('a')).toBe(300)
+    expect(reloaded.peek('ghost')).toBeUndefined()
+    expect(reloaded.averageHeight()).toBe(300)
+  })
+
+  it('revives a retired key when its row is in the list again', () => {
+    const c = new HeightCache('retire-revive-live')
+    c.set('a', 300)
+    c.set('b', 300)
+    c.set('tall', 900)
+    c.retire('tall')
+    expect(c.averageHeight()).toBe(300)
+
+    // The row came back (a refused truncation restored wholesale), so its
+    // measurement is a fact about the live transcript again.
+    c.reviveIfRetired('tall')
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 900) / 3, 5)
+
+    // Idempotent: a second revive must not add the height twice.
+    c.reviveIfRetired('tall')
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 900) / 3, 5)
+    // ...and reviving a key that was never retired is a no-op.
+    c.reviveIfRetired('a')
+    c.reviveIfRetired('never-seen')
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 900) / 3, 5)
+  })
+
+  it('re-persists a revived key', () => {
+    const c = new HeightCache('retire-revive-persist')
+    c.set('a', 300)
+    c.set('tall', 900)
+    c.retire('tall')
+    c.reviveIfRetired('tall')
+    c.flush()
+
+    const reloaded = new HeightCache('retire-revive-persist')
+    expect(reloaded.peek('tall')).toBe(900)
+  })
 })
