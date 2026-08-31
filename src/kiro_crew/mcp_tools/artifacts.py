@@ -16,6 +16,7 @@ every existing patch site.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections.abc import Callable
 from typing import Any
@@ -567,6 +568,57 @@ def schemas() -> list[dict[str, Any]]:
     ]
 
 
+# Literal-color detector for the theme-contrast hint. Hex colors are
+# 3/4/6/8 digits -- 5 and 7 are excluded on purpose so hex-ish CSS id
+# selectors ("#added1") don't fire. The leading [:=(\s"'] anchors the
+# literal to a value position (color:#111, fill="#111") rather than a
+# fragment anchor or an id selector at line start; the fixed-width
+# lookbehind additionally exempts href="#abc" fragment links (covers
+# xlink:href too, and IGNORECASE covers HREF). IGNORECASE is what lets
+# RGB(...) / HSL(...) match -- CSS functions are case-insensitive.
+# Accepted noise, documented rather than parsed away: a whitespace-
+# preceded hex-ish id selector ("... } #decade {") can still fire, but
+# whitespace must stay in the prefix class or true positives like
+# "border: 1px solid #ccc" are lost -- and the output is a soft hint.
+_HARDCODED_COLOR_RE = re.compile(
+    r"[:=(\s\"'](?<!href=[\"'])#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b"
+    r"|\brgba?\("
+    r"|\bhsla?\(",
+    re.IGNORECASE,
+)
+
+
+def _theme_contrast_hint(kind: str, content: str) -> str:
+    """Soft warning when iframe-rendered content hardcodes its palette.
+
+    Fires only for widget/html kinds (the ones rendered inside the
+    dashboard's themed iframe) whose content carries literal colors and
+    not a single ``var(--`` reference. Theme-aware content -- including
+    the recommended fallback form ``color:var(--text,#111)`` -- contains
+    ``var(--`` and stays silent. A full foreground/background *pairing*
+    check needs a CSS parser; the zero-var heuristic catches the observed
+    failure class (partially styled content clashing with the injected
+    theme defaults) with one regex, and a fully-hardcoded palette that
+    ignores the user's theme still deserves the nudge. Warning only,
+    never a reject -- same contract as the dedup and cost hints.
+    """
+    if kind not in ("widget", "html"):
+        return ""
+    if not content or "var(--" in content:
+        return ""
+    if not _HARDCODED_COLOR_RE.search(content):
+        return ""
+    return (
+        "\n\n⚠️  Hardcoded colors, no theme variables: this content renders "
+        "inside the dashboard's themed iframe, and literal colors (#hex / "
+        "rgb() / hsl()) clash when the user switches between light, dark and "
+        "custom themes -- worst when only one half of a foreground/background "
+        "pair is set. Prefer the injected theme vars with fallbacks, e.g. "
+        "`color:var(--text,#111); background:var(--bg,#fff)` -- the widgets "
+        "skill carries the full variable table."
+    )
+
+
 def artifact_save(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, ARTIFACT_SAVE_SCHEMA)
     save_body: dict[str, Any] = {
@@ -722,6 +774,7 @@ def artifact_save(name: str, args: dict[str, Any]) -> str:
         f"{dedup_hint}"
         f"{cost_hint}"
         f"{collision_hint}"
+        f"{_theme_contrast_hint(kind, args.get('content') or '')}"
     )
 
 
@@ -802,6 +855,16 @@ def artifact_update(name: str, args: dict[str, Any]) -> str:
     else:
         out.append("")
         out.append(mcp_core._artifact_ref_link(d.get("slug", slug), d.get("name", "")))
+    # Same soft nudge as artifact_save: an iterate pass that writes a
+    # hardcoded palette into a themed iframe should hear about it now,
+    # not when the user flips the dashboard theme. Content-carrying
+    # updates only -- a rename/retag has nothing to lint.
+    theme_hint = _theme_contrast_hint(
+        d.get("kind", "widget"), str(update_body.get("content") or "")
+    )
+    if theme_hint:
+        out.append("")
+        out.append(theme_hint.lstrip("\n"))
     return "\n".join(out)
 
 

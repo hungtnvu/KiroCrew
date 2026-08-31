@@ -508,6 +508,136 @@ class TestArtifactSave:
         assert "Saved artifact" in result
 
 
+class TestThemeContrastHint:
+    # The save/update responses attach a soft warning when widget/html
+    # content hardcodes its palette (literal colors, zero var(--…) use).
+    # Warning only — the save/update itself always proceeds.
+
+    def test_hint_on_hardcoded_widget_colors(self) -> None:
+        with (
+            patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+            patch(
+                "kiro_crew.mcp_core._post",
+                return_value={"slug": "perf", "version": 1, "kind": "widget"},
+            ),
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Perf page", "content": '<div style="color:#111">hi</div>'},
+            )
+        assert "Hardcoded colors, no theme variables" in result
+        assert "var(--text,#111)" in result
+
+    def test_hint_on_rgb_function(self) -> None:
+        with (
+            patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+            patch(
+                "kiro_crew.mcp_core._post",
+                return_value={"slug": "perf", "version": 1, "kind": "widget"},
+            ),
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {
+                    "name": "Perf page",
+                    "content": "<style>body{background:rgb(255,255,255)}</style>",
+                },
+            )
+        assert "Hardcoded colors, no theme variables" in result
+
+    def test_hint_on_uppercase_color_function(self) -> None:
+        # CSS functions are case-insensitive: RGB(...) is as hardcoded
+        # as rgb(...). Locks the IGNORECASE flag on the detector.
+        with (
+            patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+            patch(
+                "kiro_crew.mcp_core._post",
+                return_value={"slug": "perf", "version": 1, "kind": "widget"},
+            ),
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {
+                    "name": "Perf page",
+                    "content": '<div style="color:RGB(1,2,3)">x</div>',
+                },
+            )
+        assert "Hardcoded colors, no theme variables" in result
+
+    def test_no_hint_for_href_fragment_link(self) -> None:
+        # href="#abc" is a fragment link to an element id, not a color,
+        # even when the id happens to be hex-shaped. Locks the href
+        # lookbehind exclusion.
+        with (
+            patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+            patch(
+                "kiro_crew.mcp_core._post",
+                return_value={"slug": "perf", "version": 1, "kind": "widget"},
+            ),
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Perf page", "content": '<a href="#abc">jump</a>'},
+            )
+        assert "Hardcoded colors" not in result
+
+    def test_no_hint_when_theme_vars_present(self) -> None:
+        # The recommended fallback form carries a hex literal AND a
+        # var(--…) reference — theme-aware content must stay silent.
+        with (
+            patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+            patch(
+                "kiro_crew.mcp_core._post",
+                return_value={"slug": "perf", "version": 1, "kind": "widget"},
+            ),
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {
+                    "name": "Perf page",
+                    "content": '<div style="color:var(--text,#111);'
+                    'background:var(--bg,#fff)">hi</div>',
+                },
+            )
+        assert "Hardcoded colors" not in result
+
+    def test_no_hint_for_non_iframe_kinds(self) -> None:
+        # markdown/text/json/svg render natively (no injected theme
+        # defaults to clash with) — the lint is widget/html only.
+        with patch(
+            "kiro_crew.mcp_core._post",
+            return_value={"slug": "notes", "version": 1, "kind": "markdown"},
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Notes", "content": "color: #ff0000", "kind": "markdown"},
+            )
+        assert "Hardcoded colors" not in result
+
+    def test_update_hint_on_hardcoded_content(self) -> None:
+        with patch(
+            "kiro_crew.mcp_core._patch",
+            return_value={"slug": "perf", "version": 2, "kind": "widget", "name": "Perf"},
+        ):
+            result = _call_tool_inner(
+                "artifact_update",
+                {"slug": "perf", "content": '<body style="background:#fffbe6">x</body>'},
+            )
+        assert "Hardcoded colors, no theme variables" in result
+
+    def test_update_no_hint_without_content(self) -> None:
+        # Metadata-only updates carry nothing to lint.
+        with patch(
+            "kiro_crew.mcp_core._patch",
+            return_value={"slug": "perf", "version": 2, "kind": "widget", "name": "P2"},
+        ):
+            result = _call_tool_inner(
+                "artifact_update",
+                {"slug": "perf", "name": "P2"},
+            )
+        assert "Hardcoded colors" not in result
+
+
 class TestArtifactGet:
     def test_get_current(self) -> None:
         with patch(

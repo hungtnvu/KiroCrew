@@ -277,12 +277,33 @@ Kind is one of `widget` (default), `html`, `markdown`, `svg`, `json`, `text`.
 Use `widget` for `<mcwidget>` bodies; the others for raw content the
 dashboard renders differently.
 
+## Theme safety (widget / html kinds)
+
+Widget and html artifacts render inside the dashboard's **themed iframe**
+in whatever theme the user runs — light, dark, or a custom palette. The
+iframe injects the dashboard's theme CSS variables plus
+`body{background:var(--bg);color:var(--text)}` defaults, so:
+
+- **Use theme vars for every color**, with literal fallbacks when the
+  HTML must also render standalone:
+  `color:var(--text,#111); background:var(--bg,#fff)`. The full variable
+  table lives in the `widgets` skill.
+- **Never set one half of a foreground/background pair** with a literal
+  color — a lone `color:#111` sits on the injected dark canvas in dark
+  mode. This applies to script-generated pages pushed via the CLI just
+  as much as to inline `<mcwidget>` bodies.
+- `artifact_save` / `artifact_update` responses attach a `⚠️` hint when
+  widget/html content carries hardcoded colors and no `var(--…)`
+  reference — fix the content in the same turn rather than ignoring it.
+
 ## Don't
 
 - Don't save mcwidget output as `kind: html` — `widget` is correct.
 - Don't include the surrounding `<mcwidget title="...">` tag in `content`.
   Save the *inner* HTML body so the artifact page can wrap it in the same
   iframe sandbox.
+- Don't hardcode a color palette in widget/html artifacts — see "Theme
+  safety" above.
 - Don't churn versions on cosmetic re-renders. If you're emitting the same
   widget for display purposes (no change), don't call `artifact_update`.
 - Don't `artifact_delete` without explicit user direction. Deletes are
