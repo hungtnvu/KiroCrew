@@ -100,8 +100,9 @@ DEFAULT_TARGETS = ("src",)
 # Import targets application code may not reach.
 FORBIDDEN_ROOTS = ("kiro_crew.acp", "kiro_crew.providers")
 
-# Source trees that ARE the boundary. providers/ is temporary -- it goes when the
-# package is deleted in the RFC's final phase.
+# Source trees that ARE the boundary: the SDK plus the two packages it is built
+# on. All three stay. ACP is the SDK's foundation rather than an implementation
+# detail being sealed off, so providers/ is not scheduled for deletion.
 EXEMPT_PREFIXES = (
     "src/kiro_crew/agent_sdk/",
     "src/kiro_crew/acp/",

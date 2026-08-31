@@ -17,7 +17,9 @@ Layering::
     consumers        dashboard/  slack/  discord/  telegram/  messaging/
                      session.py  subagent.py  apps/  cli_*.py  workflows/
                             |
-                            |  may import ONLY kiro_crew.agent_sdk
+                            |  import kiro_crew.agent_sdk for anything
+                            |  provider-specific; reaching ACP directly
+                            |  for its own types stays legitimate
                             v
                      kiro_crew.agent_sdk          domain types, role protocols,
                                                   capabilities, supervisor
@@ -25,10 +27,11 @@ Layering::
                             |  resolves drivers through a registry
                             v
                      kiro_crew.agent_sdk.drivers.acp
-                                                  the ONLY module permitted to
-                                                  import kiro_crew.acp
+                                                  the only module INSIDE this
+                                                  package that imports
+                                                  kiro_crew.acp
                             v
-                     kiro_crew.acp   (private)    wire, dialects, adapters,
+                     kiro_crew.acp  (foundation)  wire, dialects, adapters,
                                                   session handles, worker pool
 
 If the gate goes red you introduced a boundary violation: fix the import
