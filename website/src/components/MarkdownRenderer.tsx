@@ -999,7 +999,31 @@ const MD_COMPONENTS: Components = {
   h5({ node, children }) { const id = slugify(children); return <h5 {...sp(node)} id={id} className="text-sm font-medium mt-2 mb-1 text-text-strong">{children}</h5> },
   h6({ node, children }) { const id = slugify(children); return <h6 {...sp(node)} id={id} className="text-[13px] font-medium mt-2 mb-1 text-muted">{children}</h6> },
   ul({ node, children, className }) { const isTasks = className?.includes('contains-task-list'); return <ul {...sp(node)} className={isTasks ? 'list-none pl-4 my-2 space-y-1' : 'list-disc pl-8 my-2 space-y-1 marker:text-muted'}>{children}</ul> },
-  ol({ node, children, className }) { const isTasks = className?.includes('contains-task-list'); return <ol {...sp(node)} className={isTasks ? 'list-none pl-4 my-2 space-y-1' : 'list-decimal pl-8 my-2 space-y-1 marker:text-muted'}>{children}</ol> },
+  // `start` must be forwarded, not dropped: a fenced block SPLITS the message
+  // into independent markdown documents (useBlockAssembler), so the list after
+  // a code block is its own <ol> that legitimately begins at 2, 3, … Without
+  // `start` every one of those restarts at 1, which is what turned a numbered
+  // set of shell steps into four items all labelled "1.". `type`/`reversed`
+  // ride along for the same reason — the sanitize schema already admits all
+  // three (ATTR_ALLOW), so nothing but this override was losing them.
+  ol({ node, children, className }) {
+    const isTasks = className?.includes('contains-task-list')
+    const props = node?.properties
+    const start = typeof props?.start === 'number' ? props.start : undefined
+    const type = typeof props?.type === 'string' ? (props.type as '1' | 'a' | 'A' | 'i' | 'I') : undefined
+    const reversed = props?.reversed === true || props?.reversed === 'true' ? true : undefined
+    return (
+      <ol
+        {...sp(node)}
+        start={start}
+        type={type}
+        reversed={reversed}
+        className={isTasks ? 'list-none pl-4 my-2 space-y-1' : 'list-decimal pl-8 my-2 space-y-1 marker:text-muted'}
+      >
+        {children}
+      </ol>
+    )
+  },
   li({ node, children, className }) {
     const isTask = className?.includes('task-list-item')
     if (!isTask) return <li {...sp(node)} className="text-sm leading-relaxed">{children}</li>
