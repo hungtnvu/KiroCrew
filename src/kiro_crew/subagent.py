@@ -165,11 +165,11 @@ def _safe_fire(coro: Awaitable[None]) -> None:
 
 _MAX_CONCURRENT = 3
 
-#: Agent names a roster never suggests: the host default and the conductor are
+#: Agent names a roster never suggests: the host default and the conductors are
 #: reached by OMITTING ``agent``, not by naming one. Shared with the spawn tools'
 #: parameter-description roster (``mcp_tools.spawn``) so the pair cannot drift
-#: when a third reserved name appears.
-UNADVERTISED_AGENTS = frozenset({"kirocrew", "kirocrew-conductor"})
+#: when a reserved name appears.
+UNADVERTISED_AGENTS = frozenset({"kirocrew", "kirocrew-conductor", "kirocrew-pipeline-conductor"})
 
 # How many valid names an unknown-agent refusal carries. The string reaches a WS
 # frame, a tombstone and the caller's transcript, so it is bounded like every
