@@ -1514,7 +1514,7 @@ def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str,
     """Remove kiro-cli's model credential from a child that does not consume it.
 
     Counterpart to :func:`inject_kiro_cli_api_key` for every ACP backend other
-    than kiro (the dormant Claude seam, and KAS): the credential authenticates
+    than kiro (Claude Code, and KAS): the credential authenticates
     kiro-cli's OWN v2 agent loop, and it is deliberately NOT in
     ``sandbox._AGENT_DENIED_ENV_KEYS``, so without this an inherited copy in the
     raw ``os.environ`` snapshot would ride into an agent process that has no use
@@ -9511,9 +9511,9 @@ def build_provider_factory(cfg: "KiroCrewConfig") -> Callable:
     Routes through ``current_context().providers.create_factory(cfg)`` (the CPP
     ``ProviderRegistry`` extension point) instead of calling
     ``cfg.create_provider_factory()`` directly, so an edition can supply an
-    alternate provider factory (e.g. re-registering an extra ACP backend through
-    the dormant ``ACP_BACKEND_*`` seam).  The ``Default`` ProviderRegistry returns
-    exactly ``cfg.create_provider_factory()``, so the public edition is
+    alternate provider factory (e.g. registering an ACP backend the core does not
+    ship, through the ``ACP_BACKEND_*`` seam).  The ``Default`` ProviderRegistry
+    returns exactly ``cfg.create_provider_factory()``, so the public edition is
     behaviorally identical to calling it directly.
 
     Fail-closed: a :class:`PlatformCompositionError` (a non-standalone host that
