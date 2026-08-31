@@ -37,7 +37,12 @@ from snowballstemmer import stemmer as _snowball_stemmer
 # int constants, imported rather than duplicated so the two cannot drift. Safe
 # direction: ``embeddings`` reaches the store only through a Protocol, so it does
 # not import this module and there is no cycle.
-from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_INTERACTIVE, PRIORITY_NORMAL
+from kiro_crew.embeddings import (
+    PRIORITY_BULK,
+    PRIORITY_INTERACTIVE,
+    PRIORITY_NORMAL,
+    bulk_pace_delay,
+)
 
 try:
     import pysqlite3 as sqlite3
@@ -3298,6 +3303,40 @@ class VectorMemoryStore:
             return ("pref.general", match.group(1).strip())
         return None
 
+    def _embed_bulk_row(self, text: str, *, pace: bool) -> "list[float] | None":
+        """Embed one row of a corpus sweep, then optionally pace the loop.
+
+        The sweeps below are the longest-running CPU work the gateway does
+        unattended — a migrated memory of a few thousand rows is tens of minutes
+        of continuous inference — and to a user that is indistinguishable from a
+        runaway process. ``memory.embedding_bulk_duty`` spreads the same total
+        work over more wall time by idling between rows (see
+        :func:`kiro_crew.embeddings.bulk_pace_delay`).
+
+        The sleep is HERE, on the sweep's own thread, and holds neither the DB
+        lock nor the model: an interactive embed arriving mid-pause is served
+        immediately. It also deliberately covers a row that failed to embed —
+        the delay is derived from measured elapsed time, so a no-op returns 0.0
+        and only real work is paced.
+
+        The pause falls between this row's inference and its write, which is what
+        makes it safe to interrupt: a sweep killed mid-pause leaves the row's
+        ``embedding`` NULL and the next sweep re-embeds it, exactly as it already
+        does for every row it never reached.
+
+        *pace* is False for a sweep a human explicitly asked for and is watching
+        a progress bar on; slowing that down would be paying the cost with none
+        of the benefit, since the load is expected in that case.
+        """
+        if not pace:
+            return self._try_embed(text, PRIORITY_BULK)
+        started = time.monotonic()
+        vec = self._try_embed(text, PRIORITY_BULK)
+        delay = bulk_pace_delay(time.monotonic() - started)
+        if delay > 0:
+            time.sleep(delay)
+        return vec
+
     def _try_embed(self, text: str, priority: int = PRIORITY_NORMAL) -> list[float] | None:
         """Embed text using embed_fn if available.
 
@@ -3603,7 +3642,7 @@ class VectorMemoryStore:
         return any(self._fetch_one_locked(sql) is not None for sql in probes)
 
     def backfill_missing_embeddings(
-        self, progress: "Callable[[int, int], None] | None" = None
+        self, progress: "Callable[[int, int], None] | None" = None, *, pace: bool = True
     ) -> int:
         """Compute embeddings for episodic rows that have none, then rebuild FAISS.
 
@@ -3636,6 +3675,12 @@ class VectorMemoryStore:
         already falls back to ``_sqlite_vector_search`` (a stdlib cosine scan
         over these blobs), so the stored vectors are useful either way; the
         index rebuild below is simply skipped when faiss is absent.
+
+        *pace* (default on) idles between rows so the sweep occupies at most
+        ``memory.embedding_bulk_duty`` of wall time — the same total CPU work
+        spread thinner, which is what keeps an unattended post-migration sweep
+        from pinning several cores for tens of minutes. Pass ``pace=False`` for a
+        sweep a human explicitly asked for and is waiting on.
         """
         if self.embed_fn is None:
             return 0
@@ -3643,13 +3688,13 @@ class VectorMemoryStore:
         # compared directly, never indexed), and they must be rebuilt even when
         # there is not a single NULL episodic row — which is exactly the state
         # after reconcile_embedding_space() on a memory that holds only lessons.
-        self._backfill_lesson_embeddings(progress)
+        self._backfill_lesson_embeddings(progress, pace=pace)
         # Same for non-lesson semantic KV rows: struct-packed, no numpy, no
         # FAISS — get_semantic_context ranks them straight from the stored blob.
         # No progress callback: the (done,total) stream belongs to the episodic
         # loop below, and a second denominator would make the dashboard bar
         # jump backward when both row types need re-embedding.
-        self._backfill_semantic_kv_embeddings()
+        self._backfill_semantic_kv_embeddings(pace=pace)
         if not _HAS_NUMPY:
             return 0
         rows = self._fetch_all_locked(
@@ -3665,7 +3710,7 @@ class VectorMemoryStore:
             # spin, and this loop can run for minutes on a large corpus.
             progress(0, total)
         for row in rows:
-            vec = self._try_embed(row["text"], PRIORITY_BULK)
+            vec = self._embed_bulk_row(row["text"], pace=pace)
             if not vec:
                 if progress is not None:
                     progress(embedded, total)
@@ -3708,7 +3753,7 @@ class VectorMemoryStore:
         return embedded
 
     def _backfill_lesson_embeddings(
-        self, progress: "Callable[[int, int], None] | None" = None
+        self, progress: "Callable[[int, int], None] | None" = None, *, pace: bool = True
     ) -> int:
         """Embed lesson rows whose vector is NULL. Returns the count embedded.
 
@@ -3754,7 +3799,7 @@ class VectorMemoryStore:
             if not text:
                 logger.debug("Skipping lesson %s with no renderable text", row["key"])
                 continue
-            vec = self._try_embed(text, PRIORITY_BULK)
+            vec = self._embed_bulk_row(text, pace=pace)
             if not vec:
                 continue
             # Stored un-normalized to match write_lesson(): _cosine_sim()
@@ -3774,7 +3819,7 @@ class VectorMemoryStore:
         return embedded
 
     def _backfill_semantic_kv_embeddings(
-        self, progress: "Callable[[int, int], None] | None" = None
+        self, progress: "Callable[[int, int], None] | None" = None, *, pace: bool = True
     ) -> int:
         """Embed non-lesson semantic rows whose vector is NULL. Returns the count.
 
@@ -3809,7 +3854,7 @@ class VectorMemoryStore:
             # landing across the embed must not commit a vector from the old
             # space (reconcile has already swept past this row).
             backfill_generation = self._space_generation
-            vec = self._try_embed(f"{row['key']} {row['value_json']}", PRIORITY_BULK)
+            vec = self._embed_bulk_row(f"{row['key']} {row['value_json']}", pace=pace)
             if not vec:
                 if progress is not None:
                     progress(embedded, total)
