@@ -242,13 +242,19 @@ def summarize_prompt_structure(blocks: object) -> dict:
     * ``type_counts`` -- a count per block ``type`` (``text`` / ``image`` /
       ``tool_use`` / ``tool_result`` / ``other`` for any unrecognised or
       typeless shape).
-    * ``empty_text_blocks`` -- text blocks whose ``text`` is present but blank
-      or whitespace-only (a structurally suspicious payload).
+    * ``empty_text_blocks`` -- text blocks whose ``text`` is missing, blank, or
+      whitespace-only (a structurally suspicious payload). A text block with no
+      ``text`` key at all is as suspect as one whose ``text`` is a blank
+      string, so both fold into this count.
     * ``tool_use`` / ``tool_result`` -- the two tool-block counts surfaced at
       the top level so a pairing imbalance (a ``tool_result`` with no matching
       ``tool_use``, or vice versa) is visible at a glance.
-    * ``total_bytes`` -- length of ``json.dumps(blocks)``, the approximate
-      serialized wire size of the outbound request.
+    * ``total_bytes`` -- length of ``json.dumps`` of the NORMALISED block list
+      (``[]`` when the argument is not a list or tuple), the approximate
+      serialized wire size of the outbound request. Measuring the normalised
+      list keeps the size coherent with the counts: a non-list argument reports
+      ``block_count: 0`` alongside ``total_bytes: 2`` (an empty ``[]``) rather
+      than a size describing a payload the counts claim is empty.
 
     This summary is deliberately safe to log: it carries no content and
     therefore cannot leak credentials or user data. That is a hard requirement
@@ -281,7 +287,10 @@ def summarize_prompt_structure(blocks: object) -> dict:
                 key = btype if btype in _SUMMARY_KNOWN_TYPES else "other"
                 if btype == "text":
                     text = block.get("text")
-                    if isinstance(text, str) and not text.strip():
+                    # A missing (or non-string) text key is as structurally
+                    # suspect as a present-but-blank one, so fold both into the
+                    # empty count.
+                    if not isinstance(text, str) or not text.strip():
                         empty_text += 1
             else:
                 key = "other"
@@ -293,7 +302,7 @@ def summarize_prompt_structure(blocks: object) -> dict:
         summary["tool_result"] = type_counts.get("tool_result", 0)
 
         try:
-            summary["total_bytes"] = len(json.dumps(blocks, default=str))
+            summary["total_bytes"] = len(json.dumps(block_list, default=str))
         except (TypeError, ValueError):
             # Unserialisable content must not sink the whole summary: keep the
             # structural counts and report an unknown size rather than raising.

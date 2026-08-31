@@ -813,6 +813,24 @@ class TestSummarizePromptStructure:
         # Three of the four text blocks are blank/whitespace-only.
         assert out["empty_text_blocks"] == 3
 
+    def test_text_block_missing_text_key_counts_as_empty(self):
+        """A ``{"type": "text"}`` with no ``text`` key at all is as
+        structurally suspect as one whose ``text`` is a blank string, so it
+        folds into the empty count alongside present-but-blank text. This is
+        exactly the malformed-payload signal the diagnostic exists to surface.
+        """
+        blocks = [
+            {"type": "text", "text": "real content"},
+            {"type": "text"},  # no text key at all
+            {"type": "text", "text": None},  # present but not a string
+            {"type": "text", "text": "   "},  # present but blank
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 4
+        assert out["type_counts"]["text"] == 4
+        # The missing key, the non-string, and the blank string all count.
+        assert out["empty_text_blocks"] == 3
+
     def test_reports_tool_use_and_tool_result_imbalance(self):
         """A tool_result with no matching tool_use is the classic malformed
         transcript; the two top-level counts expose the imbalance directly."""
@@ -903,3 +921,16 @@ class TestSummarizePromptStructure:
         assert out["tool_use"] == 0
         assert out["tool_result"] == 0
         assert out["total_bytes"] == len(json.dumps([]))
+
+    def test_non_list_argument_reports_coherent_size(self):
+        """A non-list/tuple argument normalises to an empty block list, and
+        ``total_bytes`` measures THAT normalised list -- not the raw argument.
+        So the size stays coherent with the counts (``block_count: 0`` reads as
+        an empty ``[]``) instead of "0 blocks, N bytes" describing a payload the
+        counts claim is empty. This is exactly the malformed-argument path the
+        diagnostic exists to serve."""
+        empty_bytes = len(json.dumps([]))
+        for bad in ("not a list at all", {"type": "text", "text": "x"}, 42, None):
+            out = summarize_prompt_structure(bad)
+            assert out["block_count"] == 0
+            assert out["total_bytes"] == empty_bytes
