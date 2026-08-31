@@ -6090,14 +6090,24 @@ class TestTokenPersistenceBackfill:
 
         # This simulates a claude_code session, so the backfill must run under
         # provider=claude_code for canonicalize_for_provider to map 'opus' ->
-        # 'opus-4.8-1m'. The default test config is provider=acp, under which the
-        # backfill (correctly) leaves a kiro/acp model unchanged — so force a CC
-        # config here. _run_chat reads only cfg.agent.provider (+ dashboard.
-        # merge_queued_messages) on this path, so a MagicMock cfg suffices.
+        # 'opus-4.8-1m'. Under the acp label the backfill (correctly) leaves a
+        # kiro/acp model unchanged.
+        #
+        # The provider is now resolved from the LIVE CLIENT via
+        # providers.acp.provider_label, not from cfg.agent.provider: that field is
+        # declared enum=["acp"] and validate_config_data deletes an out-of-enum
+        # value, so no real config can ever say "claude_code" and this branch was
+        # unreachable in production while the test mocked it green. The client here
+        # is a bare AsyncMock, which provider_label deliberately does not accept as
+        # a provider (it isinstance-checks, so a spec'd mock cannot claim every
+        # backend at once), so the label is patched at the seam instead -- a real
+        # CC session's client resolves to exactly this value.
         _cc_cfg = MagicMock()
-        _cc_cfg.agent.provider = "claude_code"
         _cc_cfg.dashboard.merge_queued_messages = False
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: _cc_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.provider_label", lambda _client: "claude_code"
+        )
 
         # Build a mock whose inner._model starts EMPTY so the early backfill
         # branch (chat_runner.py:471-476) finds nothing and leaves slot.model
