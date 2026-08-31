@@ -13,12 +13,17 @@ from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_STOP,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
+    HOOK_ON_ERROR_DEFAULT,
+    HOOK_ON_ERROR_FAIL_CLOSED,
+    HOOK_ON_ERROR_FAIL_OPEN,
     ScriptHook,
+    ScriptHookResult,
     ScriptHookStore,
     fire_tool_hooks,
     get_global_hook_store,
     run_script_hook,
     set_global_hook_store,
+    validate_hook_fields,
 )
 
 
@@ -414,3 +419,308 @@ class TestRunScriptHookStopEnvCap:
         parsed = json.loads(stdin_bytes)
         assert parsed["assistant_text"] == full
         assert "[OPTIONS:" in parsed["assistant_text"]
+
+
+# ── FEAT-004: PreToolUse hooks fail closed (GitHub #7339) ──
+
+
+class TestPreToolUseFailsClosed:
+    """A PreToolUse hook that cannot deliver a verdict blocks under the default
+    (fail-closed) direction.
+
+    These run the REAL subprocess path (run_script_hook against tiny shell
+    commands) so the assertions exercise the true timeout / missing-binary /
+    exit-code branches, mirroring the issue repro. Against the pre-fix code
+    there was no ``failed_to_run`` / ``should_block_pre_tool_use`` at all and a
+    timed-out or crashed PreToolUse hook silently auto-approved the tool, so
+    every ``... is True`` block assertion here would fail before the fix.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_blocks_fail_closed(self):
+        # Command sleeps past its 1s timeout, so it never reaches its own
+        # ``exit 2`` — the timeout branch fires (default exit_code -1).
+        hook = ScriptHook(
+            id="pt-timeout",
+            name="policy-timeout",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="sleep 8; exit 2",
+            timeout=1,
+        )
+        result = await run_script_hook(hook)
+        assert result.blocked is False  # never reached a clean exit 2
+        assert result.failed_to_run is True
+        # Default (sentinel) PreToolUse hook resolves fail_closed -> must block.
+        assert result.should_block_pre_tool_use() is True
+        assert result.should_block_pre_tool_use("fail_closed") is True
+
+    @pytest.mark.asyncio
+    async def test_missing_binary_blocks_fail_closed(self):
+        hook = ScriptHook(
+            id="pt-missing",
+            name="policy-missing",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="/nonexistent/policy-gate --check",
+            timeout=5,
+        )
+        result = await run_script_hook(hook)
+        # /bin/sh -c reports "command not found" as exit 127.
+        assert result.exit_code == 127
+        assert result.failed_to_run is True
+        assert result.should_block_pre_tool_use() is True
+
+    @pytest.mark.asyncio
+    async def test_crash_blocks_fail_closed(self, monkeypatch):
+        # Exercise the generic-exception branch of run_script_hook by making the
+        # spawn itself raise; run_script_hook must still return a result (never
+        # propagate) with the default exit_code -1, which is failed_to_run.
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("spawn exploded")
+
+        # run_script_hook imports sandboxed_spawn_argv_async from
+        # kiro_crew.sandbox at call time, so patch it at that source module.
+        import kiro_crew.sandbox as sandbox_mod
+
+        monkeypatch.setattr(
+            sandbox_mod, "sandboxed_spawn_argv_async", _boom, raising=False
+        )
+        hook = ScriptHook(
+            id="pt-crash",
+            name="policy-crash",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="true",
+            timeout=5,
+        )
+        result = await run_script_hook(hook)
+        assert result.exit_code not in (0, 2)
+        assert result.failed_to_run is True
+        assert result.should_block_pre_tool_use() is True
+
+    @pytest.mark.asyncio
+    async def test_clean_exit2_blocks_and_is_not_failed_to_run(self):
+        hook = ScriptHook(
+            id="pt-deny",
+            name="policy-deny",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="exit 2",
+            timeout=5,
+        )
+        result = await run_script_hook(hook)
+        assert result.exit_code == 2
+        assert result.blocked is True
+        # A clean, intentional denial is NOT a failed run.
+        assert result.failed_to_run is False
+        assert result.should_block_pre_tool_use() is True
+
+    @pytest.mark.asyncio
+    async def test_clean_exit0_allows(self):
+        hook = ScriptHook(
+            id="pt-allow",
+            name="policy-allow",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="exit 0",
+            timeout=5,
+        )
+        result = await run_script_hook(hook)
+        assert result.exit_code == 0
+        assert result.succeeded is True
+        assert result.failed_to_run is False
+        assert result.should_block_pre_tool_use() is False
+
+
+class TestPerHookFailDirection:
+    """The per-hook ``on_error`` field and its event-dependent default."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_fail_open_pretooluse_does_not_block_on_timeout(self):
+        # An operator who opted a PreToolUse hook into fail_open restores the
+        # historic pass-through even when the hook fails to run.
+        hook = ScriptHook(
+            id="pt-open",
+            name="policy-open",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="sleep 8; exit 2",
+            timeout=1,
+            on_error=HOOK_ON_ERROR_FAIL_OPEN,
+        )
+        result = await run_script_hook(hook)
+        assert result.failed_to_run is True
+        # Resolved fail_open -> a failed run must NOT manufacture a block.
+        assert result.should_block_pre_tool_use() is False
+
+    def test_default_pretooluse_resolves_fail_closed(self):
+        hook = ScriptHook(event=HOOK_EVENT_PRE_TOOL_USE)
+        assert hook.on_error == HOOK_ON_ERROR_DEFAULT
+        assert hook.effective_on_error() == HOOK_ON_ERROR_FAIL_CLOSED
+
+    def test_default_non_pretooluse_resolves_fail_open(self):
+        hook = ScriptHook(event=HOOK_EVENT_USER_PROMPT_SUBMIT)
+        assert hook.on_error == HOOK_ON_ERROR_DEFAULT
+        assert hook.effective_on_error() == HOOK_ON_ERROR_FAIL_OPEN
+
+    @pytest.mark.asyncio
+    async def test_non_gating_event_never_blocks_on_failure(self):
+        # A non-PreToolUse hook that fails resolves fail_open and never gates.
+        hook = ScriptHook(
+            id="ups-fail",
+            name="ups-fail",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command="/nonexistent/thing",
+            timeout=5,
+        )
+        result = await run_script_hook(hook)
+        assert result.failed_to_run is True
+        assert result.should_block_pre_tool_use() is False
+
+
+class TestOnErrorConfigPlumbing:
+    """from_dict fail-soft, to_dict round-trip, validate_hook_fields boundary."""
+
+    def test_from_dict_tolerates_junk_string(self):
+        hook = ScriptHook.from_dict(
+            {"event": HOOK_EVENT_PRE_TOOL_USE, "command": "true", "on_error": "nonsense"}
+        )
+        # Junk degrades to the sentinel (never raises) which still resolves
+        # fail_closed for PreToolUse — more protection, not less.
+        assert hook.on_error == HOOK_ON_ERROR_DEFAULT
+        assert hook.effective_on_error() == HOOK_ON_ERROR_FAIL_CLOSED
+
+    def test_from_dict_tolerates_non_string(self):
+        hook = ScriptHook.from_dict(
+            {"event": HOOK_EVENT_PRE_TOOL_USE, "command": "true", "on_error": 123}
+        )
+        assert hook.on_error == HOOK_ON_ERROR_DEFAULT
+
+    def test_from_dict_keeps_valid_explicit_value(self):
+        hook = ScriptHook.from_dict(
+            {
+                "event": HOOK_EVENT_PRE_TOOL_USE,
+                "command": "true",
+                "on_error": "fail_open",
+            }
+        )
+        assert hook.on_error == HOOK_ON_ERROR_FAIL_OPEN
+
+    def test_to_dict_round_trip_explicit(self):
+        hook = ScriptHook(
+            id="rt",
+            name="rt",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="true",
+            on_error=HOOK_ON_ERROR_FAIL_OPEN,
+        )
+        d = hook.to_dict()
+        assert d["on_error"] == HOOK_ON_ERROR_FAIL_OPEN
+        restored = ScriptHook.from_dict(d)
+        assert restored.on_error == HOOK_ON_ERROR_FAIL_OPEN
+        assert restored.effective_on_error() == HOOK_ON_ERROR_FAIL_OPEN
+
+    def test_validate_hook_fields_rejects_invalid_on_error(self):
+        with pytest.raises(ValueError):
+            validate_hook_fields(
+                event=HOOK_EVENT_PRE_TOOL_USE,
+                timeout=30,
+                command="true",
+                skills=[],
+                matcher="",
+                matcher_mode="glob",
+                on_error="banana",
+            )
+
+    def test_validate_hook_fields_accepts_valid_on_error(self):
+        # Sentinel and both explicit spellings must be accepted (no raise).
+        for value in (HOOK_ON_ERROR_DEFAULT, HOOK_ON_ERROR_FAIL_CLOSED, HOOK_ON_ERROR_FAIL_OPEN):
+            validate_hook_fields(
+                event=HOOK_EVENT_PRE_TOOL_USE,
+                timeout=30,
+                command="true",
+                skills=[],
+                matcher="",
+                matcher_mode="glob",
+                on_error=value,
+            )
+
+
+class TestFireToolHooksSurfacesFailClosedGap:
+    """The autonomous path (fire_tool_hooks) surfaces a non-silent WARNING for a
+    fail-closed PreToolUse hook that blocked or failed to run, and stays
+    non-fatal.
+
+    fire_tool_hooks cannot retroactively block (the tool is already running),
+    but pre-fix it DISCARDED the results silently. These tests assert the new
+    WARNING is emitted for the fail-closed failed-to-run and blocked cases and
+    NOT for a clean allow, and that an exception inside fire() never propagates.
+    """
+
+    def _result(self, exit_code: int, *, event=HOOK_EVENT_PRE_TOOL_USE, on_error="", error=""):
+        return ScriptHookResult(
+            hook_id="h1",
+            hook_name="policy-hook",
+            event=event,
+            exit_code=exit_code,
+            error=error,
+            on_error=on_error,
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_to_run_fail_closed_emits_warning(self, hook_store, caplog):
+        # exit_code -1 (timeout/crash surrogate) on a default PreToolUse hook.
+        result = self._result(-1, error="Timed out after 1s")
+        with patch.object(
+            hook_store, "fire", new_callable=AsyncMock, return_value=[result]
+        ):
+            with caplog.at_level("WARNING", logger="kiro_crew.hooks"):
+                await fire_tool_hooks(hook_store, "Running: ReadFile")
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "policy-hook" in msg
+        assert "#7339" in msg
+
+    @pytest.mark.asyncio
+    async def test_blocked_fail_closed_emits_warning(self, hook_store, caplog):
+        result = self._result(2)  # clean deny, but tool already ran
+        with patch.object(
+            hook_store, "fire", new_callable=AsyncMock, return_value=[result]
+        ):
+            with caplog.at_level("WARNING", logger="kiro_crew.hooks"):
+                await fire_tool_hooks(hook_store, "Running: ReadFile")
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "would have BLOCKED" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_clean_exit0_emits_no_warning(self, hook_store, caplog):
+        result = self._result(0)
+        with patch.object(
+            hook_store, "fire", new_callable=AsyncMock, return_value=[result]
+        ):
+            with caplog.at_level("WARNING", logger="kiro_crew.hooks"):
+                await fire_tool_hooks(hook_store, "Running: ReadFile")
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    @pytest.mark.asyncio
+    async def test_fail_open_failed_to_run_emits_no_warning(self, hook_store, caplog):
+        # An explicit fail_open PreToolUse hook that failed to run is not a gap.
+        result = self._result(-1, on_error=HOOK_ON_ERROR_FAIL_OPEN, error="boom")
+        with patch.object(
+            hook_store, "fire", new_callable=AsyncMock, return_value=[result]
+        ):
+            with caplog.at_level("WARNING", logger="kiro_crew.hooks"):
+                await fire_tool_hooks(hook_store, "Running: ReadFile")
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    @pytest.mark.asyncio
+    async def test_fire_exception_is_non_fatal(self, hook_store, caplog):
+        # An exception inside fire() must NOT propagate out of fire_tool_hooks
+        # (the "informational hooks must never break dispatch" contract).
+        with patch.object(
+            hook_store,
+            "fire",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ):
+            with caplog.at_level("WARNING", logger="kiro_crew.hooks"):
+                await fire_tool_hooks(hook_store, "Running: ReadFile")
+        # No WARNING (the gap-surfacing path is skipped) and, crucially, no raise.
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
