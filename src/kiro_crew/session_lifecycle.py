@@ -20,6 +20,17 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from kiro_crew.metrics.sessions import (
+    END_REASON_DESTROYED,
+    END_REASON_DISCARDED,
+    END_REASON_REMOVED,
+    END_REASON_RESET,
+    END_REASON_RETIRED,
+    END_REASON_SHUTDOWN,
+    END_REASON_UNCLAIMED,
+    record_session_ended,
+)
+
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 StopOutcome = Literal["soft", "hard", "idle"]
 ProviderFactory = Callable[..., Any]
@@ -427,6 +438,7 @@ class SessionLifecycleService:
                         exc_info=True,
                     )
             logger.debug("Reset session: %s (pid=%s)", key, pid)
+            record_session_ended(key, end_reason=END_REASON_RESET)
         return session is not None
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
@@ -464,6 +476,7 @@ class SessionLifecycleService:
             # and must be reaped separately from the parent provider.
             await owner.release_subagent_runtime(key)
             self._deps.logger.info("Removed session (map preserved): %s", key)
+            record_session_ended(key, end_reason=END_REASON_REMOVED)
 
     async def retire_kiro_identity_sessions(self) -> tuple[list[str], bool]:
         """Retire idle Kiro-backed processes after an identity-store change.
@@ -516,6 +529,10 @@ class SessionLifecycleService:
                 await provider.shutdown()
                 await owner.release_subagent_runtime(key)
                 retired.append(key)
+                # This path pops the registry directly above rather than calling
+                # reset, so without its own record the session's start crumb is
+                # never consumed and the next boot reports it as crashed.
+                record_session_ended(key, end_reason=END_REASON_RETIRED)
             except Exception:
                 logger.warning(
                     "Failed to retire session %s after an identity change",
@@ -624,6 +641,7 @@ class SessionLifecycleService:
             "Removed unclaimed speculative session (map preserved): %s",
             key,
         )
+        record_session_ended(key, end_reason=END_REASON_UNCLAIMED)
         return True
 
     async def destroy(self, key: str) -> None:
@@ -649,6 +667,7 @@ class SessionLifecycleService:
                 reason=constants.unbind_reason_session_destroyed,
             )
             self._deps.logger.info("Destroyed session (map deleted): %s", key)
+            record_session_ended(key, end_reason=END_REASON_DESTROYED)
 
     async def discard_conversation(
         self, key: str, *, replay: bool = True, skip_if_busy: bool = False
@@ -714,6 +733,7 @@ class SessionLifecycleService:
                 "Discarded native conversation (sid cleared, map entry kept): %s",
                 key,
             )
+            record_session_ended(key, end_reason=END_REASON_DISCARDED)
         return True
 
     async def drain_active_turns(self, timeout: float | None = None) -> int:
@@ -907,6 +927,11 @@ class SessionLifecycleService:
             owner._compact_cooldown_until.clear()
             self._suppress_replay.clear()
             owner._compact_pending_verdict.clear()
+
+        # Outside the registry lock: recording a lifetime reads the session's
+        # start crumb off disk, and the lock must not span blocking IO.
+        for closed_key in sessions:
+            record_session_ended(closed_key, end_reason=END_REASON_SHUTDOWN)
 
         # Provider shutdown can enqueue multiple blocking process-maintenance
         # jobs, so keep the original bounded fan-out.

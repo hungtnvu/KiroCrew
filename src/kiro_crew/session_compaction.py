@@ -20,6 +20,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
+from kiro_crew.metrics.sessions import END_REASON_RECYCLED, record_session_ended
+
 if TYPE_CHECKING:
     # Type-only: importing providers.base from this leaf at runtime enters the
     # providers -> acp package -> runtime -> session_pid -> providers cycle.
@@ -348,6 +351,12 @@ class CompactionCoordinator:
             else:
                 owner._session_map.clear_sid(key)
                 await popped.provider.shutdown()
+                # Recorded only on this branch: it is the one that actually
+                # popped the entry, so the crumb belongs to the session torn down
+                # here. On the branch above the registry already holds a
+                # SUCCESSOR under this key, and consuming its crumb would credit
+                # the successor's lifetime to this recycle and orphan its own.
+                record_session_ended(key, end_reason=END_REASON_RECYCLED)
                 self._deps.logger.info("Recycled session %s (context overflow; sid cleared)", key)
             await owner._fire_compact_callback(key, pct, success=True)
         finally:
@@ -501,6 +510,10 @@ class CompactionCoordinator:
 
     async def _fire_compact_callback(self, key: str, pct: float, *, success: bool) -> None:
         """Mark reinjection and invoke the compact callback, swallowing errors."""
+        # Every compaction that reached a verdict passes here, whether or not a
+        # callback is registered, so this is where the counter belongs: the early
+        # return below would otherwise drop the surfaces that register none.
+        emit_counter(CONTEXT_COMPACTIONS, {"success": bool(success)})
         # Recycling destroys this session, so its successor receives startup
         # context normally.  The identity guard also avoids flagging a racing
         # replacement while the old provider is being reaped.
