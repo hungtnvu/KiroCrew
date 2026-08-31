@@ -4048,7 +4048,18 @@ class ScriptHookStore:
                 "on_error",
             ):
                 if k in data:
-                    setattr(hook, k, data[k])
+                    # `on_error` is normalized on the way in — trimmed,
+                    # lowercased, junk degraded to the sentinel — exactly as
+                    # `create` does via `from_dict`/`_normalize_hook_on_error`,
+                    # so both write paths accept the same spellings (e.g.
+                    # " Fail_Closed ") and degrade junk identically. Without
+                    # this, `update` set the raw request value and then the
+                    # strict `validate_hook_fields` rejected a spelling `create`
+                    # would have accepted.
+                    if k == "on_error":
+                        setattr(hook, k, _normalize_hook_on_error(data[k]))
+                    else:
+                        setattr(hook, k, data[k])
             if "skills" in data:
                 skills_raw = data["skills"]
                 hook.skills = [str(s) for s in skills_raw if isinstance(s, str)] if isinstance(skills_raw, list) else []

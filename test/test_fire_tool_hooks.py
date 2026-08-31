@@ -724,3 +724,141 @@ class TestFireToolHooksSurfacesFailClosedGap:
                 await fire_tool_hooks(hook_store, "Running: ReadFile")
         # No WARNING (the gap-surfacing path is skipped) and, crucially, no raise.
         assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
+class TestOnErrorApiSchema:
+    """The dashboard API write path must accept ``on_error`` and thread it to
+    the store.
+
+    ``validate_tool_args`` rejects unknown fields, so before ``on_error`` was
+    declared on ``HOOK_CREATE_SCHEMA`` / ``HOOK_UPDATE_SCHEMA`` a request
+    carrying it got a 400 and the per-hook override was reachable only by
+    hand-editing ``hooks.json``. These tests exercise the exact schema the
+    dashboard handlers call so the gap cannot silently reopen.
+    """
+
+    def test_create_schema_accepts_on_error(self):
+        from kiro_crew.validation import HOOK_CREATE_SCHEMA, validate_tool_args
+
+        cleaned = validate_tool_args(
+            {
+                "name": "gate",
+                "command": "true",
+                "event": HOOK_EVENT_PRE_TOOL_USE,
+                "on_error": HOOK_ON_ERROR_FAIL_OPEN,
+            },
+            HOOK_CREATE_SCHEMA,
+        )
+        assert cleaned["on_error"] == HOOK_ON_ERROR_FAIL_OPEN
+
+    def test_create_schema_defaults_on_error_to_sentinel(self):
+        from kiro_crew.validation import HOOK_CREATE_SCHEMA, validate_tool_args
+
+        cleaned = validate_tool_args(
+            {"name": "gate", "command": "true", "event": HOOK_EVENT_PRE_TOOL_USE},
+            HOOK_CREATE_SCHEMA,
+        )
+        # Absent -> included with the sentinel default (not treated as unknown).
+        assert cleaned["on_error"] == HOOK_ON_ERROR_DEFAULT
+
+    def test_create_schema_rejects_invalid_on_error(self):
+        from kiro_crew.validation import (
+            HOOK_CREATE_SCHEMA,
+            ValidationError,
+            validate_tool_args,
+        )
+
+        with pytest.raises(ValidationError):
+            validate_tool_args(
+                {
+                    "name": "gate",
+                    "command": "true",
+                    "event": HOOK_EVENT_PRE_TOOL_USE,
+                    "on_error": "banana",
+                },
+                HOOK_CREATE_SCHEMA,
+            )
+
+    def test_update_schema_accepts_on_error(self):
+        from kiro_crew.validation import HOOK_UPDATE_SCHEMA, validate_tool_args
+
+        cleaned = validate_tool_args(
+            {"on_error": HOOK_ON_ERROR_FAIL_CLOSED}, HOOK_UPDATE_SCHEMA
+        )
+        assert cleaned["on_error"] == HOOK_ON_ERROR_FAIL_CLOSED
+
+    def test_update_schema_omits_on_error_when_absent(self):
+        from kiro_crew.validation import HOOK_UPDATE_SCHEMA, validate_tool_args
+
+        # Optional on update: absent stays absent (partial-update semantics),
+        # so it never clobbers an existing value.
+        cleaned = validate_tool_args({"name": "x"}, HOOK_UPDATE_SCHEMA)
+        assert "on_error" not in cleaned
+
+    def test_create_schema_output_flows_to_store(self, hook_store):
+        from kiro_crew.validation import HOOK_CREATE_SCHEMA, validate_tool_args
+
+        cleaned = validate_tool_args(
+            {
+                "name": "gate",
+                "command": "true",
+                "event": HOOK_EVENT_PRE_TOOL_USE,
+                "on_error": HOOK_ON_ERROR_FAIL_OPEN,
+            },
+            HOOK_CREATE_SCHEMA,
+        )
+        # The handler passes `cleaned` straight to store.create; assert the
+        # field survives end to end onto the persisted hook.
+        hook = hook_store.create(cleaned)
+        assert hook.on_error == HOOK_ON_ERROR_FAIL_OPEN
+
+
+class TestOnErrorStoreNormalizationParity:
+    """``create`` and ``update`` must normalize ``on_error`` identically.
+
+    Pre-fix ``update`` set the raw request value while ``create`` normalized via
+    ``from_dict``, so ``" Fail_Closed "`` passed create but was rejected by
+    update's strict ``validate_hook_fields``. Both paths must now trim,
+    lowercase, and degrade junk to the sentinel the same way.
+    """
+
+    def test_update_normalizes_mixed_case_whitespace(self, hook_store):
+        hook = hook_store.create(
+            {"name": "gate", "command": "true", "event": HOOK_EVENT_PRE_TOOL_USE}
+        )
+        updated = hook_store.update(hook.id, {"on_error": " Fail_Open "})
+        assert updated is not None
+        assert updated.on_error == HOOK_ON_ERROR_FAIL_OPEN
+
+    def test_update_degrades_junk_to_sentinel(self, hook_store):
+        hook = hook_store.create(
+            {"name": "gate", "command": "true", "event": HOOK_EVENT_PRE_TOOL_USE}
+        )
+        updated = hook_store.update(hook.id, {"on_error": "garbage"})
+        assert updated is not None
+        # Junk degrades to the sentinel (matches create/from_dict), which still
+        # resolves fail_closed for PreToolUse — never raises, never fails open.
+        assert updated.on_error == HOOK_ON_ERROR_DEFAULT
+
+    def test_create_and_update_agree_for_same_input(self, tmp_path):
+        # Same mixed-case/whitespace input must yield the same stored value
+        # whether it arrives via create or via update.
+        raw = " FAIL_closed "
+        store_a = ScriptHookStore(tmp_path / "a")
+        created = store_a.create(
+            {
+                "name": "gate",
+                "command": "true",
+                "event": HOOK_EVENT_PRE_TOOL_USE,
+                "on_error": raw,
+            }
+        )
+
+        store_b = ScriptHookStore(tmp_path / "b")
+        base = store_b.create(
+            {"name": "gate", "command": "true", "event": HOOK_EVENT_PRE_TOOL_USE}
+        )
+        updated = store_b.update(base.id, {"on_error": raw})
+
+        assert updated is not None
+        assert created.on_error == updated.on_error == HOOK_ON_ERROR_FAIL_CLOSED

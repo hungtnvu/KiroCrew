@@ -4714,11 +4714,17 @@ async def _run_chat(
                             "text": f"Hook {r.hook_name} BLOCKED (fail-closed): {reason[:100]}",
                         },
                     )
-                elif r.exit_code not in (0, 2) and r.stderr:
+                elif r.exit_code not in (0, 2) and (r.stderr or r.error):
                     # Non-zero, non-block: show warning. This is now reached only
                     # for a non-gating event, or for a PreToolUse hook whose
-                    # resolved fail direction is fail_open (pass-through).
-                    logger.warning("Hook %s warning: %s", r.hook_name, r.stderr[:200])
+                    # resolved fail direction is fail_open (pass-through). A
+                    # fail_open PreToolUse hook that TIMED OUT sets `r.error` but
+                    # usually leaves `r.stderr` empty (#7339); include `r.error`
+                    # in the trigger and message so an operator who opted a hook
+                    # out of blocking still gets a signal that it failed, instead
+                    # of the failure being dropped with no log at all.
+                    detail = (r.stderr or r.error or "").strip()[:200]
+                    logger.warning("Hook %s warning: %s", r.hook_name, detail)
         except Exception as exc:
             if event == HOOK_EVENT_PRE_TOOL_USE:
                 logger.warning("Hook fire error during blocking event %s: %s", event, exc)
