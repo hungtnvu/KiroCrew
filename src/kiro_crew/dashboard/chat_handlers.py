@@ -2310,6 +2310,22 @@ def _reject_pending_approvals(slot: _ChatSlot) -> None:
             )
 
 
+def _slot_still_ours(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
+    """Return True iff ``name`` in ``_slots`` is still the exact object we popped.
+
+    A close pops the slot, then awaits (task cancel, ``save_slot_off_loop``,
+    ``sessions.remove``). A concurrent same-key recreate (POST /api/chat, or the
+    session_close MCP verb) can mint a REPLACEMENT slot for the same key inside
+    that window. ``state._slots.get(name)`` returning a different object — or None
+    — means the key is no longer ours to tear down. This is a synchronous, purely
+    read-only identity check: it has NO side effects and does not touch the loop,
+    the session map, or history; callers use it to decide whether the destructive
+    teardown steps (closed=True save, ``sessions.remove``, failure-arm restore)
+    would clobber a live replacement, and skip them if so.
+    """
+    return state._slots.get(name) is slot
+
+
 def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
     """Unblock EVERY thing a stop/interrupt could leave the runner waiting on.
 
@@ -3807,12 +3823,35 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
             await asyncio.wait_for(asyncio.shield(slot.task), timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
+    # Post-pop teardown race: across the awaits above (and the app-notify awaits
+    # before the pop) a concurrent same-key recreate — a POST /api/chat or the
+    # session_close MCP verb — can mint a REPLACEMENT slot under `name`, reusing
+    # the same history key and the same session. If that happened, writing THIS
+    # (original) slot as closed=True would overwrite the replacement's shared
+    # transcript, and the sessions.remove below would tear down the session the
+    # replacement now uses. The original was already popped and its task
+    # cancelled, so the close is effectively complete for it; leave the
+    # replacement — its slot, its history, its session — untouched and report
+    # success. `_slot_still_ours` is a synchronous identity check, so no recreate
+    # can slip between it and the save that follows on this same frame.
+    if not _slot_still_ours(state, name, slot):
+        _sync_dashboard_slots(state)
+        state.push_slots_update()
+        return web.json_response({"ok": True})
     try:
         await save_slot_off_loop(state, slot, closed=True, closed_at=closed_at, best_effort=False)
     except Exception:
         # Save failed — restore slot so data isn't lost
         logger.error("Failed to save slot %s to history, restoring", name, exc_info=True)
-        state._slots[name] = slot
+        # ...but only if the key is still free or still ours. A recreate that
+        # landed while save_slot_off_loop was in flight now owns `name`; blindly
+        # writing `state._slots[name] = slot` would clobber that live replacement
+        # with the failed original. Restore only when the slot is genuinely still
+        # ours (or the key is now empty); otherwise leave the replacement in place
+        # and still run the loop/app-notify compensation the failed close owes.
+        _current = state._slots.get(name)
+        if _current is None or _current is slot:
+            state._slots[name] = slot
         # The close did not happen, so the loop retired for it must come back —
         # a restored session with no clock is an abandoned unattended worker.
         await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
@@ -3846,8 +3885,13 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         state.push_slots_update()
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
-    # Kill the per-tab session to free resources
-    await state.sessions.remove(_history_key_for(name))
+    # Kill the per-tab session to free resources. Re-check identity ONE more
+    # time: a recreate can land between the save above and this remove, and
+    # `_history_key_for(name)` is the SAME session key the replacement now uses,
+    # so removing it would tear down the live replacement's session. Skip it if
+    # the key is no longer ours.
+    if _slot_still_ours(state, name, slot):
+        await state.sessions.remove(_history_key_for(name))
     _sync_dashboard_slots(state)
     state.push_slots_update()
     state.push_refresh("history")
@@ -3993,6 +4037,17 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                 await asyncio.wait_for(asyncio.shield(removed.task), timeout=2.0)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+        # Post-pop teardown race (same as the single-tab close): across the
+        # cancel await above a concurrent same-key recreate can mint a
+        # REPLACEMENT slot under `name`, reusing this history key and session.
+        # If so, flushing+saving THIS (original) slot as closed=True would
+        # overwrite the replacement's shared transcript, and the sessions.remove
+        # below would tear down the session the replacement now uses. Skip both
+        # for this key and move on WITHOUT counting it archived — we must not
+        # mark a live replacement as archived-over. The original was already
+        # popped and cancelled, so the archive is effectively complete for it.
+        if not _slot_still_ours(state, name, removed):
+            continue
         try:
             # Order is unchanged and load-bearing: the cancel above, then the
             # flush, then the save. What the guard adds is failure handling, and
@@ -4013,7 +4068,15 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             logger.error(
                 "Cleanup: failed to flush held notes or archive slot %s", name, exc_info=True
             )
-            state._slots[name] = removed
+            # Restore only if the key is still free or still ours: a recreate that
+            # landed while save_slot_off_loop was in flight now owns `name`, and
+            # blindly writing `state._slots[name] = removed` would clobber that
+            # live replacement with the failed original. Skip the restore in that
+            # case; the error-row / dead-task handling below still applies to the
+            # original object we hold.
+            _current = state._slots.get(name)
+            if _current is None or _current is removed:
+                state._slots[name] = removed
             # Restoring the slot does not undo the cancel above, and ``running`` is
             # derived from the task, so a cancel that already completed reads False:
             # the tab returns looking idle and dispatchable with that turn's output
@@ -4034,7 +4097,15 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             continue
         else:
             state._restricted_keys.discard(f"dashboard:{name}")
-        # Session cleanup is best-effort — history is already written
+        # Re-check identity ONE more time: a recreate can land between the save
+        # above and here, and `_history_key_for(name)` is the SAME session key
+        # the replacement now uses. If the key is no longer ours, skip the
+        # session teardown AND do NOT report the key archived (it is not — a live
+        # replacement owns it); move on without touching the replacement's
+        # session or its running task.
+        if not _slot_still_ours(state, name, removed):
+            continue
+        # Session cleanup is best-effort — history is already written.
         try:
             await state.sessions.remove(_history_key_for(name))
         except Exception:

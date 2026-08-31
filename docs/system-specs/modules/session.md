@@ -458,6 +458,26 @@ compaction cooldown clears it too (`reset`, `remove`,
 `close_all`), because slot keys ARE reused and a leaked flag would starve the
 NEXT holder of that key of its re-anchor.
 
+Slot-key reuse is also why the dashboard close/teardown path re-checks identity
+after it pops the slot. Both `api_chat_slot_delete` and `api_chat_slots_cleanup`
+pop `name` out of `state._slots` and then run several AWAITS — cancel the task,
+`save_slot_off_loop(..., closed=True)`, `sessions.remove(_history_key_for(name))`.
+Across that window a concurrent same-key recreate (a `POST /api/chat`, or the
+`session_close` MCP verb) can mint a REPLACEMENT slot under the same key, reusing
+the same history key and the same session. Because both handlers still hold the
+popped object (`slot` / `removed`), `state._slots.get(name) is <popped>` is a
+synchronous, race-free identity check: it is evaluated BEFORE the closed=True save
+and again BEFORE `sessions.remove` at both sites, and when a replacement now owns
+the key the destructive save and the `sessions.remove` are SKIPPED so the close
+neither writes the original's transcript over the replacement's shared history nor
+tears down the session the replacement now uses (the original was already popped
+and cancelled, so the close is effectively complete for it). The failure arms
+apply the same guard to their restores (`state._slots[name] = slot` / `= removed`):
+they run only when the key is still free or still the popped object, never
+clobbering a live replacement. The `note_slot_closed` tombstone (below) still fires
+before these awaits for the reconcile reader; it is NOT the vehicle for this guard,
+which is a pure post-pop identity re-check confined to the two teardown handlers.
+
 Three properties the route holds, each of which fails silently if broken:
 
 - The key comes from `effective_session_key(slot)`, never a derived
