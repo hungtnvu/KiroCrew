@@ -270,17 +270,26 @@ async def test_delete_failure_arm_does_not_clobber_replacement(tmp_path, monkeyp
 async def test_delete_failure_arm_compensation_runs_even_when_restore_skipped(
     tmp_path, monkeypatch
 ) -> None:
-    """(c2) The failure arm's NON-_slots compensation still fires past the guard.
+    """(c2) The un-gated compensation still fires; the gated one is refused.
 
     The guard skips only the ``state._slots[name] = slot`` write when a
-    replacement owns the key. Everything else the failed close owes the ORIGINAL
-    must still run: the retired auto-nudge loop has to be put back (a restored
-    session with no clock is an abandoned worker) and the app must be told the
-    dismissal was undone (the notify already SUCCEEDED, durably pausing a crew).
-    This pins that both compensations fire even though the ``_slots`` restore was
-    skipped in favour of the live replacement — a fix that guarded the restore
-    but also short-circuited the compensation would leave a disabled worker and a
-    clockless loop behind the surviving replacement.
+    replacement owns the key. The two compensations the failed close would
+    otherwise owe the ORIGINAL behave differently, and correctly so:
+
+    - app-notify-undo (``notify_slot_close_undone``) is gated ONLY on
+      ``slot._app`` with no identity check, so the durably-committed dismissal is
+      taken back regardless of who owns the key now. It MUST still fire.
+    - the retired auto-nudge loop is restored via
+      ``_restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is
+      slot)``. Once a replacement owns ``name`` that admission check is False, so
+      ``AutoNudgeService._add_unserialized`` raises ``NudgeAdmissionRefused`` and
+      ``_restore_slot_nudge_loop`` swallows it — the loop is deliberately NOT
+      revived. Reviving it would arm a clock on a session the original no longer
+      holds; the replacement runs its own lifecycle.
+
+    This pins that the un-gated app compensation fires even though the ``_slots``
+    restore was skipped in favour of the live replacement, while the nudge-loop
+    restore is correctly refused by its admission check.
     """
     state = _state_with_slot(tmp_path)
     original = state._slots[NAME]
@@ -321,9 +330,14 @@ async def test_delete_failure_arm_compensation_runs_even_when_restore_skipped(
     assert resp.status == 500
     # The _slots restore was skipped: the live replacement is untouched.
     assert state._slots.get(NAME) is replacement, "the failure arm clobbered the replacement"
-    # ...but the compensation the original is owed still ran.
+    # The un-gated app-notify-undo still fired (no identity check on _app).
     assert undone == [NAME], "app-notify-undo did not fire when the _slots restore was skipped"
-    assert svc.get_by_slot(NAME) is not None, "the retired nudge loop was not restored"
+    # The nudge-loop restore is correctly REFUSED: its admission check
+    # (state.get_slot(name) is slot) is False while a replacement owns the key,
+    # so _add_unserialized raises NudgeAdmissionRefused and the loop stays retired.
+    assert (
+        svc.get_by_slot(NAME) is None
+    ), "the retired loop was revived onto a key the original no longer owns"
     svc.stop()
 
 
