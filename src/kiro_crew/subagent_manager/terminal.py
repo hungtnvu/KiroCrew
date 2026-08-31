@@ -428,7 +428,17 @@ class TerminalCoordinator(ManagerComponent):
             info.done = True
             if not info.error and not info.user_stopped:
                 # A user stop is neutral — never synthesize a reap error for it.
-                if reason == "startup_timeout":
+                if info._awaiting_approval and info._exec_started is None:
+                    # Approval-parked reap: the run never began execution — it sat
+                    # registered behind an unanswered spawn approval and the
+                    # reaper's wall clock fired before the (longer) approval window
+                    # closed. It reached no execution deadline, so DO NOT frame it
+                    # as one. Both conjuncts are load-bearing: run.py also sets
+                    # `_awaiting_approval` for mid-run TOOL prompts (where
+                    # `_exec_started` is already set), so `_exec_started is None`
+                    # is what distinguishes "never started" from "was running".
+                    info.error = f"Reaped after {int(elapsed)}s while still awaiting an unanswered spawn approval (never started) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
+                elif reason == "startup_timeout":
                     info.error = f"Failed to start within {self._manager._startup_deadline}s (no runtime launched, no turn produced) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
                 else:
                     info.error = f"Reaped after {int(elapsed)}s (exceeded {self._manager._default_timeout}s deadline) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
