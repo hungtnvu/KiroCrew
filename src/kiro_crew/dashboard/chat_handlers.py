@@ -26,10 +26,13 @@ from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     KiroCrewConfig,
     _workspace_name_for_dir,
     config_dir,
     default_project_dir,
+    published_autocompact_pct,
     resolve_agent_bindings,
 )
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
@@ -4618,6 +4621,69 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             _broadcast_context_reset(state, slot.key, None)
         state.push_slots_update()
         return web.json_response({"ok": True, "model": model_name})
+
+
+async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
+    """GET/POST /api/chat/slots/{slot}/autocompact — per-session compact threshold.
+
+    GET returns the slot's override (``pct``, null when it follows the global),
+    the current global (``global_pct``), and the valid range. POST takes
+    ``{"pct": <number|null>}``: a number sets this session's override (rejected
+    outside the documented range, matching the global knob's PATCH validation),
+    null clears it back to the global. The value applies to the live session
+    immediately via the SessionManager override map and persists with the slot
+    metadata, so it survives gateway restarts.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_autocompact")
+    if denied is not None:
+        return denied
+    if request.method == "GET":
+        return web.json_response(
+            {
+                "pct": slot.autocompact_pct,
+                "global_pct": published_autocompact_pct(),
+                "min": AUTOCOMPACT_PCT_MIN,
+                "max": AUTOCOMPACT_PCT_MAX,
+            }
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    if "pct" not in body:
+        return web.json_response({"error": "pct is required (number or null)"}, status=400)
+    pct = body["pct"]
+    if pct is not None:
+        # bool is an int subclass; True would otherwise read as 1.0 and be
+        # rejected by range, but reject it explicitly for a clear error.
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return web.json_response({"error": "pct must be a number or null"}, status=400)
+        pct = float(pct)
+        if pct != pct:  # NaN
+            return web.json_response({"error": "pct must be a finite number"}, status=400)
+        if not (AUTOCOMPACT_PCT_MIN <= pct <= AUTOCOMPACT_PCT_MAX):
+            return web.json_response(
+                {
+                    "error": (
+                        f"pct must be between {AUTOCOMPACT_PCT_MIN:g} "
+                        f"and {AUTOCOMPACT_PCT_MAX:g}"
+                    )
+                },
+                status=400,
+            )
+    slot.autocompact_pct = pct
+    # Apply live: the compaction gate reads the SessionManager override map,
+    # so the new threshold binds on the very next context reading.
+    state.sessions.set_autocompact_pct(effective_session_key(slot), pct)
+    logger.info("Slot %s autocompact_pct set to %r", name, pct)
+    # Persist with the slot metadata (picked up by the periodic dirty flush).
+    slot._dirty = True
+    return web.json_response({"ok": True, "pct": pct, "global_pct": published_autocompact_pct()})
 
 
 async def api_chat_slots_model(request: web.Request) -> web.Response:

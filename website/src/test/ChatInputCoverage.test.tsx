@@ -1,8 +1,10 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, fireEvent } from '@testing-library/react'
+import { screen, fireEvent, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import ChatInput from '../components/ChatInput'
+import { api } from '../api/client'
+import { SlotProvider } from '../providers/SlotContext'
 import type { PasteBlock } from '../utils/pasteTokens'
 
 // Collapsed-paste tokens are the composer's most intricate keyboard surface:
@@ -624,5 +626,42 @@ describe('ChatInput context-usage popover', () => {
   it('renders no context chip at all when the host reports no percentage', () => {
     renderWithProviders(<ChatInput {...base} />)
     expect(screen.queryByLabelText('Context usage')).toBeNull()
+  })
+
+  // ── per-session auto-compact threshold (slider section) ──────────────────
+  // The section fetches lazily on popover open, so each test mocks the GET
+  // and wraps ChatInput in a SlotProvider to give it a slot to fetch for.
+
+  const renderWithSlot = (ui: React.ReactElement) =>
+    renderWithProviders(<SlotProvider slotId="test-slot">{ui}</SlotProvider>)
+
+  it('shows the override value with a reset-to-global link when overridden', async () => {
+    vi.spyOn(api, 'chatSlotAutocompact').mockResolvedValue({ pct: 85, global_pct: 70, min: 5, max: 90 })
+    const post = vi.spyOn(api, 'setChatSlotAutocompact').mockResolvedValue({ ok: true, pct: null, global_pct: 70 })
+    renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
+    fireEvent.click(screen.getByLabelText('Context usage'))
+    expect(await screen.findByText('Auto-compact at')).toBeInTheDocument()
+    expect(screen.getByText('85%')).toBeInTheDocument()
+    // Clearing posts null for THIS slot (debounced, hence waitFor).
+    fireEvent.click(screen.getByText('Reset to global (70%)'))
+    await waitFor(() => expect(post).toHaveBeenCalledWith('test-slot', null), { timeout: 1500 })
+  })
+
+  it('shows the global value and a following-global note when not overridden', async () => {
+    vi.spyOn(api, 'chatSlotAutocompact').mockResolvedValue({ pct: null, global_pct: 70, min: 5, max: 90 })
+    renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
+    fireEvent.click(screen.getByLabelText('Context usage'))
+    expect(await screen.findByText('Following global (70%)')).toBeInTheDocument()
+    expect(screen.getByText('70%')).toBeInTheDocument()
+    expect(screen.queryByText(/Reset to global/)).toBeNull()
+  })
+
+  it('omits the slider section entirely when the threshold fetch fails', async () => {
+    vi.spyOn(api, 'chatSlotAutocompact').mockRejectedValue(new Error('offline'))
+    renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
+    fireEvent.click(screen.getByLabelText('Context usage'))
+    expect(await screen.findByText('Context window')).toBeInTheDocument()
+    await waitFor(() => expect(api.chatSlotAutocompact).toHaveBeenCalled())
+    expect(screen.queryByText('Auto-compact at')).toBeNull()
   })
 })

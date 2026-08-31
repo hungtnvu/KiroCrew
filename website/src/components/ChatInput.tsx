@@ -8,7 +8,7 @@ import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
 import type { AudioSample } from '../hooks/mic'
 import { createPortal } from 'react-dom'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useBranding } from '../hooks/useBranding'
 import { useAppSelector, useAppDispatch } from '../store'
 import { resolveByApprovalId, openActivityToTool, openActivityToTab, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, markSubagentApproving, sseSubagentDone } from '../store/chatSlice'
@@ -29,7 +29,7 @@ import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
-import { Btn } from './ui'
+import { Btn, Slider } from './ui'
 import { useTouchPushToTalk } from '../hooks/useTouchPushToTalk'
 import { consumeComposerRelease } from '../pages/chat/composerFocus'
 import BusySendButton, { useBusySendMode } from './BusySendButton'
@@ -1100,6 +1100,12 @@ function ChatInput({
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
+  // Per-session auto-compact threshold (slider in the context popover). The
+  // debounce timer collapses a slider drag into one POST; the fetch itself is
+  // the React Query below (declared after the shared queryClient), so the
+  // value lives in the standard cache rather than hand-rolled state.
+  const autoCompactTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => { if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current) }, [])
   // Shelf responsiveness: measure the shelf row width and collapse chips to
   // icon-only (agent/project) + drop the model effort label when space is tight.
   // Truncation handles the in-between cases.
@@ -1324,6 +1330,38 @@ function ChatInput({
   // SkillPickerMenu's exactly — including the trailing agent segment — or the
   // prefetch warms a different entry and the menu still pays the fetch on open.
   const queryClient = useQueryClient()
+  // Per-session auto-compact threshold: fetched lazily on popover open (the
+  // slots frame stays untouched), cached under the standard query layer. The
+  // slider writes optimistically into the cache per step and the debounced
+  // mutation collapses a drag into one POST; the response re-syncs the cache.
+  const autoCompactQuery = useQuery({
+    queryKey: ['slot-autocompact', activeSlot ?? null],
+    queryFn: () => api.chatSlotAutocompact(activeSlot as string),
+    enabled: ctxPopoverOpen && !!activeSlot,
+    staleTime: 30_000,
+  })
+  const autoCompact = autoCompactQuery.data ?? null
+  const autoCompactMutation = useMutation({
+    mutationFn: ({ slot, pct }: { slot: string; pct: number | null }) => api.setChatSlotAutocompact(slot, pct),
+    onSuccess: (r, vars) => {
+      queryClient.setQueryData(
+        ['slot-autocompact', vars.slot],
+        (prev: { pct: number | null; global_pct: number; min: number; max: number } | undefined) =>
+          prev ? { ...prev, pct: r.pct, global_pct: r.global_pct } : prev,
+      )
+    },
+  })
+  const pushAutoCompact = useCallback((pct: number | null) => {
+    if (!activeSlot) return
+    const slot = activeSlot
+    queryClient.setQueryData(
+      ['slot-autocompact', slot],
+      (prev: { pct: number | null; global_pct: number; min: number; max: number } | undefined) =>
+        prev ? { ...prev, pct } : prev,
+    )
+    if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current)
+    autoCompactTimer.current = setTimeout(() => autoCompactMutation.mutate({ slot, pct }), 400)
+  }, [activeSlot, queryClient, autoCompactMutation])
   const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined
   const skillSlotKeyRef = useRef(skillSlotKey)
   skillSlotKeyRef.current = skillSlotKey
@@ -3691,6 +3729,33 @@ function ChatInput({
                           {modelName && (
                             <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
                               <span className="text-muted">{i18nT('components.chatInput.model')}</span><span className="text-text truncate max-w-[120px]" title={modelName}>{modelName}</span>
+                            </div>
+                          )}
+                          {autoCompact && (
+                            <div className="mt-2 pt-2 border-t border-border">
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="text-[11px] text-muted">{i18nT('components.chatInput.auto_compact_at')}</span>
+                                <span className="text-[12px] font-mono font-bold text-accent">{fmtPercent(Math.round(autoCompact.pct ?? autoCompact.global_pct) / 100)}</span>
+                              </div>
+                              <Slider
+                                value={autoCompact.pct ?? autoCompact.global_pct}
+                                onChange={v => pushAutoCompact(v)}
+                                min={autoCompact.min}
+                                max={autoCompact.max}
+                                step={1}
+                                formatValue={v => fmtPercent(v / 100)}
+                                aria-label={i18nT('components.chatInput.auto_compact_threshold')}
+                              />
+                              {autoCompact.pct != null ? (
+                                <Btn
+                                  className="mt-1 px-0 py-0 border-none text-[10px] text-muted underline hover:text-text hover:bg-transparent"
+                                  onClick={() => pushAutoCompact(null)}
+                                >
+                                  {i18nT('components.chatInput.reset_to_global', { pct: Math.round(autoCompact.global_pct) })}
+                                </Btn>
+                              ) : (
+                                <div className="mt-1 text-[10px] text-muted">{i18nT('components.chatInput.following_global', { pct: Math.round(autoCompact.global_pct) })}</div>
+                              )}
                             </div>
                           )}
                   </div>
