@@ -1970,6 +1970,19 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
         outcome="success",
         extra={"slug": slug},
     )
+    # Withdraw the destination copy, AFTER the local delete and using the record captured
+    # above. Deleting the artifact used to remove the local record and leave a published
+    # copy served with nothing left to withdraw it by -- for a public destination that is
+    # content the user believes they deleted, still readable by anyone holding the link.
+    #
+    # The ordering is the point. Doing this BEFORE the local delete was tried and
+    # reverted: it put a network round trip inside the window where a concurrent save
+    # could re-write the artifact, and a failure there could 500 a delete request that
+    # could then never succeed. Running it after means the local delete is already
+    # committed, the handle is one we already read for the version capture (so no extra
+    # read), and a destination failure costs a log line rather than the user's request.
+    if _existing is not None and _existing.publication is not None:
+        await publish_sync.delete_for_artifact(_existing)
     # Deleted variant: open views of this slug toast + leave.
     _notify_artifact_update(
         state, slug, _existing.version if _existing is not None else 0, deleted=True
@@ -4156,6 +4169,10 @@ async def api_artifact_publish_providers(request: web.Request) -> web.Response:
                 # False + present in this list ⇒ installs on first publish; the
                 # FE may surface an "installs on first use" hint.
                 "available": avail,
+                # The remedy text for `available: false`. Without it the picker can only
+                # send the user somewhere generic, and a provider's own hint is the only
+                # thing that knows WHICH action makes it available.
+                "install_hint": str(getattr(p, "install_hint", "") or ""),
                 "sharing_model": _sharing_model_dict(sm),
                 "sync_model": {
                     "authority": sy.authority,
