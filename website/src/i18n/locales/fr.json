@@ -4892,7 +4892,9 @@
         "library_added": "Ajouté {{when}}",
         "library_open": "Ouvrir {{name}} dans Artefacts",
         "files_empty_title": "Fichiers est vide",
-        "files_empty_body": "Ce dossier contient les fichiers que vous importez depuis votre ordinateur. Il est distinct de Bibliothèque, qui contient les éléments créés par Kiro pour vous."
+        "files_empty_body": "Ce dossier contient les fichiers que vous importez depuis votre ordinateur. Il est distinct de Bibliothèque, qui contient les éléments créés par Kiro pour vous.",
+        "library_remove": "Retirer",
+        "library_remove_confirm": "Retirer « {{name}} » de la bibliothèque cloud ?"
       },
       "page": {
         "title": "AWS Control",

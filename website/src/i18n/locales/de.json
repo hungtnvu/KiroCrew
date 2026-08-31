@@ -4812,7 +4812,9 @@
         "library_added": "Hinzugefügt {{when}}",
         "library_open": "{{name}} in Artefakte öffnen",
         "files_empty_title": "Dateien ist leer",
-        "files_empty_body": "Dieser Ordner enthält Dateien, die Sie vom Computer hochladen. Er ist getrennt von Bibliothek, die von Kiro für Sie erstellte Inhalte enthält."
+        "files_empty_body": "Dieser Ordner enthält Dateien, die Sie vom Computer hochladen. Er ist getrennt von Bibliothek, die von Kiro für Sie erstellte Inhalte enthält.",
+        "library_remove": "Entfernen",
+        "library_remove_confirm": "„{{name}}“ aus der Cloud-Bibliothek entfernen?"
       },
       "page": {
         "title": "AWS Control",

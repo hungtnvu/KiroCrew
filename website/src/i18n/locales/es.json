@@ -4892,7 +4892,9 @@
         "library_added": "Añadido {{when}}",
         "library_open": "Abrir {{name}} en Artefactos",
         "files_empty_title": "Archivos está vacío",
-        "files_empty_body": "Esta carpeta contiene archivos que subes desde tu equipo. Está separada de Biblioteca, que contiene las cosas que Kiro creó para ti."
+        "files_empty_body": "Esta carpeta contiene archivos que subes desde tu equipo. Está separada de Biblioteca, que contiene las cosas que Kiro creó para ti.",
+        "library_remove": "Quitar",
+        "library_remove_confirm": "¿Quitar “{{name}}” de la biblioteca en la nube?"
       },
       "page": {
         "title": "AWS Control",

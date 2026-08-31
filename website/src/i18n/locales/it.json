@@ -4892,7 +4892,9 @@
         "library_added": "Aggiunto {{when}}",
         "library_open": "Apri {{name}} in Artefatti",
         "files_empty_title": "File è vuoto",
-        "files_empty_body": "Questa cartella contiene i file che carichi dal computer. È separata da Libreria, che contiene gli elementi creati da Kiro per te."
+        "files_empty_body": "Questa cartella contiene i file che carichi dal computer. È separata da Libreria, che contiene gli elementi creati da Kiro per te.",
+        "library_remove": "Rimuovi",
+        "library_remove_confirm": "Rimuovere «{{name}}» dalla libreria cloud?"
       },
       "page": {
         "title": "AWS Control",

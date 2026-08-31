@@ -4892,7 +4892,9 @@
         "library_added": "Adicionado {{when}}",
         "library_open": "Abrir {{name}} em Artefatos",
         "files_empty_title": "Arquivos está vazio",
-        "files_empty_body": "Esta pasta guarda arquivos que você envia do seu computador. É separada de Biblioteca, que guarda as coisas que o Kiro criou para você."
+        "files_empty_body": "Esta pasta guarda arquivos que você envia do seu computador. É separada de Biblioteca, que guarda as coisas que o Kiro criou para você.",
+        "library_remove": "Remover",
+        "library_remove_confirm": "Remover “{{name}}” da biblioteca na nuvem?"
       },
       "page": {
         "title": "AWS Control",

@@ -4732,7 +4732,9 @@
         "library_added": "{{when}} 添加",
         "library_open": "在产物中打开 {{name}}",
         "files_empty_title": "“文件”为空",
-        "files_empty_body": "此文件夹存放你从电脑上传的文件。它与“库”是分开的，“库”存放 Kiro 为你生成的内容。"
+        "files_empty_body": "此文件夹存放你从电脑上传的文件。它与“库”是分开的，“库”存放 Kiro 为你生成的内容。",
+        "library_remove": "移除",
+        "library_remove_confirm": "从云端库中移除“{{name}}”？"
       },
       "page": {
         "title": "AWS Control",

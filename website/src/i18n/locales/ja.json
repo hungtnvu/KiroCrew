@@ -4732,7 +4732,9 @@
         "library_added": "{{when}} に追加",
         "library_open": "アーティファクトで {{name}} を開く",
         "files_empty_title": "「ファイル」は空です",
-        "files_empty_body": "このフォルダーには、コンピューターからアップロードしたファイルが入ります。Kiro が作成したものが入る「ライブラリ」とは別です。"
+        "files_empty_body": "このフォルダーには、コンピューターからアップロードしたファイルが入ります。Kiro が作成したものが入る「ライブラリ」とは別です。",
+        "library_remove": "削除",
+        "library_remove_confirm": "「{{name}}」をクラウドライブラリから削除しますか？"
       },
       "page": {
         "title": "AWS Control",

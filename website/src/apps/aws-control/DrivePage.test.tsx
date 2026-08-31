@@ -32,6 +32,7 @@ vi.mock('./api', async () => {
       costs: vi.fn(),
       library: vi.fn(),
       libraryPush: vi.fn(),
+      libraryRemove: vi.fn(),
       backup: vi.fn(),
       backupRun: vi.fn(),
       backupNightly: vi.fn(),
@@ -671,6 +672,73 @@ describe('DrivePage', () => {
     expect(await screen.findByTestId('library-not-pushable')).toBeTruthy()
     // No push control at all on an image card -- nothing to click and be refused.
     expect(screen.queryByTestId('library-push')).toBeNull()
+  })
+
+  /**
+   * Removal is gated on a cloud copy existing: a synced card offers Remove, an
+   * unsynced one has nothing to empty. The gate matters more than the button --
+   * one synced fixture would look identical whether the control were gated or
+   * hardcoded.
+   */
+  it('offers Remove on synced cards only, behind an inline confirm', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
+    vi.mocked(awsControlApi.library).mockResolvedValue({
+      artifacts: [
+        { slug: 'notes', name: 'Notes', kind: 'markdown', version: 4, updatedAt: '2026-08-20T00:00:00Z', pushedVersion: 4, pushedAt: '2026-08-20T00:00:00Z' },
+        { slug: 'draft', name: 'Draft', kind: 'markdown', version: 2, updatedAt: '2026-08-20T00:00:00Z', pushedVersion: null, pushedAt: null },
+      ],
+    })
+    vi.mocked(awsControlApi.libraryRemove).mockResolvedValue({ removed: true } as never)
+
+    await renderDrive('library')
+    fireEvent.click(await screen.findByTestId('library-add-open'))
+    await screen.findByTestId('library-add-dialog')
+
+    // Only the synced card carries the trigger.
+    expect(await screen.findAllByTestId('library-tile')).toHaveLength(2)
+    expect(screen.getAllByTestId('library-remove')).toHaveLength(1)
+
+    // The trigger opens a named confirm; nothing is deleted yet.
+    fireEvent.click(screen.getByTestId('library-remove'))
+    expect(await screen.findByTestId('library-remove-confirm')).toBeTruthy()
+    expect(awsControlApi.libraryRemove).not.toHaveBeenCalled()
+
+    // Cancel closes the strip without a call.
+    fireEvent.click(screen.getByTestId('library-remove-cancel'))
+    expect(screen.queryByTestId('library-remove-confirm')).toBeNull()
+    expect(awsControlApi.libraryRemove).not.toHaveBeenCalled()
+
+    // Confirming actually removes.
+    fireEvent.click(screen.getByTestId('library-remove'))
+    fireEvent.click(await screen.findByTestId('library-remove-action'))
+    await waitFor(() => expect(awsControlApi.libraryRemove).toHaveBeenCalledWith(ACCOUNT.account, 'notes'))
+  })
+
+  /**
+   * A failed cloud delete must render, not vanish: the strip closing before the
+   * outcome was known hid the failure entirely (the reviewed-away bug), so the
+   * strip stays open and delete_failed appears on the card.
+   */
+  it('keeps the confirm open and says so when the removal fails', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
+    vi.mocked(awsControlApi.library).mockResolvedValue({
+      artifacts: [
+        { slug: 'notes', name: 'Notes', kind: 'markdown', version: 4, updatedAt: '2026-08-20T00:00:00Z', pushedVersion: 4, pushedAt: '2026-08-20T00:00:00Z' },
+      ],
+    })
+    vi.mocked(awsControlApi.libraryRemove).mockRejectedValue(new Error('boom'))
+
+    await renderDrive('library')
+    fireEvent.click(await screen.findByTestId('library-add-open'))
+    fireEvent.click(await screen.findByTestId('library-remove'))
+    fireEvent.click(await screen.findByTestId('library-remove-action'))
+
+    // The failure renders on the card, and the strip is still there to retry
+    // or cancel -- a silent close was the bug this design replaces.
+    expect(await screen.findByTestId('library-remove-error')).toBeTruthy()
+    expect(screen.getByTestId('library-remove-confirm')).toBeTruthy()
   })
 
   it('the picker searches by name and reports when nothing matches', async () => {
