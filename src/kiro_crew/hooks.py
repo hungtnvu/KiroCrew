@@ -4291,21 +4291,47 @@ async def fire_tool_hooks(
     parent_session_key: str | None = None,
     agent_role: str | None = None,
 ) -> None:
-    """Fire PreToolUse hooks for an EVENT_TOOL_CALL event.
+    """Fire PreToolUse hooks for an EVENT_TOOL_CALL event (autonomous path).
 
     PostToolUse is NOT fired here because EVENT_TOOL_CALL is a notification
     that the tool is starting - the tool hasn't completed yet. PostToolUse
     should be fired on EVENT_TOOL_RESULT when available.
 
-    Note: For EVENT_TOOL_CALL, hooks are informational only. The tool is
-    already running (auto-approved by kiro-cli), so hook results cannot
-    block execution. Hook scripts can log, audit, or trigger side effects.
+    CONTRACT (read this before relying on it to gate). On the autonomous /
+    subagent surfaces (subagent_manager/run.py, task_executor.py, llm_helpers.py,
+    acp/client.py) kiro-cli emits EVENT_TOOL_CALL AFTER it has already
+    auto-approved and STARTED the tool. By the time this runs the tool is
+    already executing, so a PreToolUse hook here is *informational only* and
+    CANNOT retroactively block it — that is an architectural fact of the
+    autonomous path, not a defect. Hook scripts may log, audit, or trigger
+    side effects, but their exit code cannot stop the call.
+
+    What this function DOES guarantee: it no longer silently discards the
+    PreToolUse results. When a hook whose resolved fail direction is
+    ``fail_closed`` blocks (exit 2) or fails to deliver a verdict (timeout,
+    crash, or missing/non-runnable binary), that is surfaced LOUDLY via a
+    WARNING naming the hook and stating the tool has already run — so the
+    silent-approval failure mode (GitHub #7339) is observable on the very
+    surface where it can no longer be prevented. This inspection is
+    best-effort and NON-FATAL: any error inside it (including ``fire()``
+    raising or returning a non-list) is swallowed so observability never
+    breaks the tool-call notification path.
+
+    Where PreToolUse hooks actually GATE and fail closed is the dashboard chat
+    path — see ``dashboard/chat_runner.py`` (``_fire`` /
+    ``_pre_tool_hooks_should_block``), wired in FEAT-002 — because that surface
+    consults the results BEFORE the tool is approved. This function does not
+    and cannot provide that guarantee.
 
     Optional ``subagent_id``, ``parent_session_key``, and ``agent_role`` are
     forwarded to the underlying hook_store so hook scripts can attribute
     tool calls to the specific agent/session that fired them. Callers in
     parent contexts (dashboard chat, generic LLM helpers) leave them as
     ``None``; subagent and taskrunner callers pass real values.
+
+    Returns ``None`` in all cases (the autonomous callers do not act on a
+    return value); the fail-closed gap is reported through the logger, not the
+    return type.
     """
     if hook_store is None:
         return
@@ -4319,7 +4345,7 @@ async def fire_tool_hooks(
         except Exception:
             pass
     try:
-        await hook_store.fire(
+        results = await hook_store.fire(
             HOOK_EVENT_PRE_TOOL_USE,
             tool_name=tool_name,
             tool_input=tool_input,
@@ -4329,3 +4355,45 @@ async def fire_tool_hooks(
         )
     except Exception:
         logger.debug("PreToolUse hook error", exc_info=True)
+        return
+    # Inspect the results we would otherwise discard: a fail-closed PreToolUse
+    # hook that BLOCKED or FAILED TO RUN could not stop this already-started
+    # tool on the autonomous path, so make that gap non-silent (WARNING). Fully
+    # wrapped so this observability step can NEVER break dispatch — the
+    # "informational hooks must never break dispatch" contract (and its tests)
+    # require a no-op even when fire() returns [] or something non-iterable.
+    try:
+        for result in results or []:
+            try:
+                if result.event != HOOK_EVENT_PRE_TOOL_USE:
+                    continue
+                # Resolve the fail direction against the result's own event; the
+                # sentinel resolves to fail_closed for PreToolUse.
+                if _resolve_on_error(
+                    getattr(result, "on_error", HOOK_ON_ERROR_DEFAULT), result.event
+                ) != HOOK_ON_ERROR_FAIL_CLOSED:
+                    continue
+                if not (result.blocked or result.failed_to_run):
+                    continue
+                verb = (
+                    "would have BLOCKED"
+                    if result.blocked
+                    else "FAILED to deliver a verdict"
+                )
+                logger.warning(
+                    "PreToolUse policy hook %s %s tool %r, but this is the "
+                    "autonomous path (EVENT_TOOL_CALL): the tool was already "
+                    "auto-approved and started by kiro-cli, so execution could "
+                    "NOT be prevented (fail-closed gap, GitHub #7339). "
+                    "PreToolUse hooks only gate on the dashboard chat path.",
+                    result.hook_name or result.hook_id,
+                    verb,
+                    tool_name,
+                )
+            except Exception:
+                # A single malformed result must not stop us inspecting the rest,
+                # and must never surface to the caller.
+                logger.debug("PreToolUse result inspection error", exc_info=True)
+    except Exception:
+        # Non-iterable results, or any other unexpected shape: stay non-fatal.
+        logger.debug("PreToolUse results inspection error", exc_info=True)
