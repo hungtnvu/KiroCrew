@@ -1898,6 +1898,124 @@ def _doctor_model_url_reachable(issues: list[str]) -> None:
         print("               keep retrying with backoff on every gateway boot.")
 
 
+def _aws_profile_names(config_path: Path) -> list[str]:
+    """Profile names declared in an AWS config file, and nothing else from it.
+
+    Deliberately a header scan rather than a parse: this file can hold values an
+    operator would not expect ``doctor`` to touch, and the only thing worth
+    reporting is which profiles EXIST. Nothing read here is ever printed except a
+    profile name, and the credentials file is never opened at all — its existence
+    is the whole signal.
+    """
+    names: list[str] = []
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return names
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        header = stripped[1:-1].strip()
+        name = header[len("profile ") :].strip() if header.startswith("profile ") else header
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _credential_vendor_line() -> str:
+    """The edition's credential-vending MCP servers, or "" when there are none.
+
+    Runs the capability-manager lookup on its own event loop because ``doctor`` is
+    synchronous. Degrades to "" on any failure — including an already-running loop
+    — since the absence of this line is indistinguishable from the public
+    edition's normal state and must never fail the run.
+    """
+    try:
+        from kiro_crew.deny_guidance import credential_tool_hint
+        from kiro_crew.platform.capability_bound import bind_capability_manager
+        from kiro_crew.platform.context import current_context, safe_context_call
+        from kiro_crew.platform.defaults import DefaultCapabilityManager
+
+        manager = safe_context_call(
+            lambda: current_context().capability_manager,
+            fallback_factory=lambda: bind_capability_manager(DefaultCapabilityManager()),
+            log_message=None,
+        )
+        if not manager.available():
+            return ""
+        return credential_tool_hint(asyncio.run(manager.list_mcp()))
+    except Exception:
+        return ""
+
+
+def _doctor_credentials(issues: list[str]) -> None:
+    """Report the AWS / credential posture the agent will actually see.
+
+    Exists because "my agent cannot reach AWS" had no self-service answer: the
+    agent is allowed to run AWS CLI calls but not to read credential files, so a
+    refused read looks identical to having no credentials at all, and nothing on
+    either side of that told the operator which one they had.
+
+    Advisory only, like the pod-session-bus and memory-pressure probes: ``issues``
+    is doctor's exit-code channel, and an unconfigured AWS profile is not a Kiro
+    Crew fault. Reporting it is right; failing on it would make ``doctor`` red on
+    every host that simply does not use AWS.
+
+    No secret value is read or printed. ``~/.aws/credentials`` is probed for
+    existence only, and from ``~/.aws/config`` only section headers and the
+    presence of a ``credential_process`` key are consulted.
+    """
+    del issues  # advisory-only diagnostic; keeps the call-site signature uniform
+    print("\nCredentials")
+    aws_dir = Path.home() / ".aws"
+    config_path = aws_dir / "config"
+    creds_path = aws_dir / "credentials"
+    has_config = config_path.is_file()
+    has_creds = creds_path.is_file()
+    if not has_config and not has_creds:
+        print("  aws:         ⏹ no ~/.aws config (agents can still run AWS CLI once you")
+        _print_wrapped(
+            "configure one — the SDK resolves credentials itself, so the agent never "
+            "needs to read the files. Run `aws configure sso` or `aws configure` in "
+            "your own terminal."
+        )
+    else:
+        profiles = _aws_profile_names(config_path) if has_config else []
+        if profiles:
+            shown = ", ".join(_safe_display(name) for name in profiles[:6])
+            extra = f" (+{len(profiles) - 6} more)" if len(profiles) > 6 else ""
+            print(f"  aws profiles:✅ {shown}{extra}")
+        elif has_creds:
+            print("  aws profiles:✅ default (from ~/.aws/credentials)")
+        else:
+            print("  aws profiles:⚠️  ~/.aws/config has no profile sections")
+        # A credential_process entry is the setup worth calling out: it vends
+        # short-lived credentials on demand, so the agent's AWS calls keep working
+        # across a token expiry without anyone re-running a login.
+        uses_process = False
+        if has_config:
+            try:
+                uses_process = "credential_process" in config_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except Exception:
+                uses_process = False
+        if uses_process:
+            print("  refresh:     ✅ credential_process configured (auto-refreshing)")
+        else:
+            print("  refresh:     ⏹ no credential_process — credentials may expire mid-task")
+    vendor = _credential_vendor_line()
+    if vendor:
+        print("  vending MCP: ✅ available")
+        _print_wrapped(vendor)
+    print("  note:        ℹ️  agents cannot READ credential files; AWS CLI calls are allowed")
+    _print_wrapped(
+        "If an agent reports that AWS is unavailable, it most likely hit the "
+        "credential-file block rather than a missing setup. See blocked-commands.md."
+    )
+
+
 def _doctor_headless_auth(issues: list[str]) -> None:
     """Report an API-key credential the INSTALLED service cannot see.
 
@@ -2628,6 +2746,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     _doctor_path_launcher()
     _doctor_trust_root()
     _doctor_strict_identity(cfg)
+
+    # ── Credentials (AWS / credential-vending MCP) ──
+    # After identity, before the agent-facing sections: this is the answer to
+    # "the agent says it cannot reach AWS", which is a credential-posture
+    # question rather than an agent one.
+    _doctor_credentials(issues)
 
     # ── Agents dir janitor (orphaned atomic-write temps + stale backups) ──
     _doctor_agents_janitor(issues, cfg.agent.sweep_agents_backups)

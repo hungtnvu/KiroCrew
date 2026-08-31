@@ -826,6 +826,19 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # classification as ``cli_doctor.py::_doctor`` above.
         "cli_doctor.py::_discord_intent_grants",
         "cli_doctor.py::_doctor_mcp_tools",
+        # The AST heuristic matches ``asyncio.run`` (attr ``run`` on base
+        # ``asyncio``), used to drive one async capability-manager read from the
+        # loop-less doctor path so the Credentials section can report whether this
+        # host mounts a credential-vending MCP server. Unlike the sibling
+        # ``asyncio.run`` entries above this one is not purely a false positive:
+        # on a composed edition the awaited ``list_mcp()`` does reach that
+        # edition's own package manager as a child process. It is benign for the
+        # reasons the allowlist asks for — the argv is the manager's own fixed
+        # subcommand with no agent-influenced component, doctor is operator-
+        # invoked rather than agent-reachable, the result is read-only and never
+        # carries a credential value, and the public default spawns nothing at all
+        # (``available()`` is False, so the await is never issued).
+        "cli_doctor.py::_credential_vendor_line",
         # Read-only diagnostic for the Source Checkout section: ``git -C <repo>
         # rev-parse/rev-list`` with a hardcoded argv whose only variable is the
         # install's own source directory (derived from the package's module
